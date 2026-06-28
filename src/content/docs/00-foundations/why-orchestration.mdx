@@ -1,0 +1,45 @@
+---
+title: Why Orchestration?
+description: The problem Kubernetes was built to solve.
+---
+import Quiz from '../../../components/Quiz';
+import Diagram from '../../../components/Diagram';
+import { whyOrchestrationQuiz } from '../../../data/quizzes';
+import { controlPlaneNodes } from '../../../data/diagrams';
+
+One container on one laptop is easy. The trouble starts when you run *many*
+containers across *many* machines and need them to stay healthy without you
+watching. Who restarts a crashed process at 3am? Who moves work off a dead
+node? Who adds copies when traffic spikes and removes them when it fades? Who
+wires up networking so a hundred short-lived containers can still find each
+other?
+
+Doing all of that by hand does not scale. An **orchestrator** lets you instead
+*declare the outcome you want* — "run 5 copies of this app, reachable at this
+address" — and then continuously works to make reality match. This idea, called
+**desired-state reconciliation**, is the single most important concept in this
+whole book. Kubernetes is, at heart, a large collection of loops that each
+watch some piece of the world and nudge it back toward what you declared.
+
+## The control plane at a glance
+
+The brain that does this reconciling is the **control plane**. You will meet
+every piece of it in Part 1, but here are the two you should know first — click
+each one:
+
+<Diagram client:visible id="cp-intro" title="Control plane (preview)" nodes={controlPlaneNodes} />
+
+The **API server** is the front door: everything — you, the components, the
+tools — talks to the cluster through it. **etcd** is the cluster's memory: the
+single source of truth for what you declared and what currently exists.
+
+## Where we are headed
+
+Before Kubernetes makes sense, the layer beneath it has to: containers, the
+Linux features that make them possible, the networking that connects them, and
+the distributed-systems ideas that make reconciliation reliable. That is
+Part 0. Then we climb.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-why-orchestration" questions={whyOrchestrationQuiz} />

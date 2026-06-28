@@ -1,0 +1,51 @@
+---
+title: Distributed Systems Concepts
+description: Desired state, reconciliation, control loops, and fault tolerance.
+---
+import Quiz from '../../../components/Quiz';
+import { distSysQuiz } from '../../../data/quizzes';
+
+Kubernetes is a **distributed system**: many machines cooperating to behave like
+one. That setting forces a particular design, and once you see the pattern you
+will recognize it everywhere in the system.
+
+## Desired state vs. actual state
+
+You tell Kubernetes the **desired state** ("5 replicas of this app exist"). The
+**actual state** is whatever is true right now ("4 are running, 1 just
+crashed"). These drift apart constantly — nodes fail, processes die, traffic
+shifts. The job of the system is to keep closing the gap.
+
+## The control loop
+
+The mechanism is the **control loop**, and it never stops:
+
+1. **Observe** the actual state.
+2. **Compare** it to the desired state.
+3. **Act** to reduce the difference.
+4. Repeat, forever.
+
+Almost every component in Kubernetes — the thing that manages replicas, the
+thing that manages nodes, the thing that manages endpoints — is one of these
+loops, called a **controller**. This is why the system *self-heals*: kill a Pod
+and a loop simply notices the gap and recreates it. You did not write recovery
+logic; you declared an outcome and the loop maintains it.
+
+## Why declarative beats imperative here
+
+In a system where anything can fail at any moment, *step-by-step* instructions
+("create this, then that") are fragile — if a step fails halfway, what now?
+*Declarative* desired state is robust: there is no "halfway." The loop just
+keeps comparing and acting until reality matches, no matter how it got knocked
+off course. This is the philosophical core of everything that follows.
+
+## Fault tolerance
+
+Because state lives in **etcd** (a replicated, consistent store) and work is
+driven by always-running loops, the cluster tolerates the failure of individual
+nodes and components without losing track of what *should* be true. Reconcile,
+recover, repeat.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-distsys" questions={distSysQuiz} />
