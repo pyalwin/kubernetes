@@ -1,0 +1,64 @@
+---
+title: Rollouts & GitOps
+description: Rolling updates, maxSurge/maxUnavailable, probes, rollback, canary/blue-green, and GitOps reconciliation.
+---
+import Diagram from '../../../components/Diagram';
+import Quiz from '../../../components/Quiz';
+import { rolloutsNodes, rolloutsQuiz } from '../../../data/production';
+
+Shipping a new version while users are live is where production gets nervous.
+Kubernetes makes the default path safe by treating a release as *another
+reconciliation*: change the desired state, and a controller carefully closes the
+gap.
+
+## Rolling updates
+
+A **Deployment** updates by default with a **rolling update** — it replaces old
+Pods with new ones a few at a time, never taking everything down at once. Two
+knobs bound the disruption:
+
+- **maxUnavailable** — how many Pods may be missing below the desired count
+  during the roll (e.g. `25%`).
+- **maxSurge** — how many *extra* Pods may be created above the desired count to
+  speed things up.
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate: { maxSurge: 25%, maxUnavailable: 25% }
+```
+
+## Probes gate the rollout
+
+The safety comes from **readiness probes**. A freshly started Pod receives no
+traffic and does *not* count as available until its readiness probe passes. So
+if version 2 boots but fails its `/healthz` check, the rollout **stalls** with
+old Pods still serving — your users never touch the broken version. If something
+slips through, `kubectl rollout undo deploy/web` performs an instant **rollback**
+to the previous ReplicaSet.
+
+## Blue-green and canary
+
+When a rolling update isn't cautious enough you reach for two patterns.
+**Blue-green** runs the new version (green) fully in parallel with the old
+(blue), then flips traffic in one switch — fast rollback, double the resources.
+**Canary** sends a small slice of traffic (say `5%`) to the new version, watches
+its error and latency metrics, and only then ramps to `100%`. Both trade extra
+machinery for a smaller blast radius.
+
+## GitOps — the reconcile loop, applied to delivery
+
+The deepest idea ties straight back to the cluster's own design. In **GitOps**,
+a Git repository holds the declarative desired state, and a controller
+(**Argo CD** or **Flux**) runs a continuous loop: compare the cluster to the
+repo, and correct any drift. Sound familiar? It is the same observe-compare-act
+control loop that powers controllers, now lifted to *deployment*. The repo
+becomes the single source of truth — every change is a reviewed, audited commit,
+and a rollback is just `git revert`. Nobody hand-applies YAML to prod; they merge
+a PR and let reconciliation do the work.
+
+<Diagram client:visible id="gitops-diagram" title="GitOps reconciliation" nodes={rolloutsNodes} />
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-rollouts" questions={rolloutsQuiz} />

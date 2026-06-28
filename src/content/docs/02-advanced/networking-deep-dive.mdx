@@ -1,0 +1,62 @@
+---
+title: Networking Deep Dive
+description: CNI, Ingress, and NetworkPolicy — how traffic flows in and through a cluster.
+---
+import Quiz from '../../../components/Quiz';
+import Diagram from '../../../components/Diagram';
+import { networkingAdvancedQuiz, ingressDiagram } from '../../../data/advanced';
+
+Part 0 introduced Services and cluster DNS. Now go a layer deeper: how pods get IPs
+at all, how outside traffic reaches them over HTTP, and how you lock down what may
+talk to what.
+
+## The CNI — a flat pod network
+
+Kubernetes itself does not implement pod networking. It defines an interface — the
+**CNI** (Container Network Interface) — and delegates to a plugin like Calico,
+Cilium, or Flannel. When a pod is created, the kubelet calls the CNI plugin, which
+assigns the pod an IP and wires up its virtual network interface. The model the CNI
+must deliver is a **flat network**: every pod gets a routable IP and **any pod can
+reach any other pod's IP directly**, across nodes, with no NAT. That flat space is
+the foundation Services and DNS are built on — they're just stable names and virtual
+IPs layered over the raw pod IPs the CNI hands out.
+
+## Ingress — L7 HTTP routing
+
+A Service of type `LoadBalancer` gives you an external L4 entry point, but one per
+service gets expensive and can't route by URL. An **Ingress** is an L7 (HTTP) router:
+a single front door that dispatches requests to different Services by **hostname and
+path** — `shop.example.com/api` to one Service, `shop.example.com/` to another — and
+terminates TLS. The Ingress *resource* is just rules; an **IngressController** (nginx,
+Traefik, or a cloud controller) actually runs the proxy and enforces them. The flow
+from the internet inward:
+
+<Diagram client:visible id="ingress-flow" title="Ingress → Service → Pods" nodes={ingressDiagram} />
+
+Click each box: the Ingress terminates TLS and routes by host/path, the Service
+load-balances over the current pods, and the pods are the ephemeral endpoints whose
+changing IPs the Service tracks so the Ingress never has to.
+
+## NetworkPolicy — from default-allow to least privilege
+
+By default, the flat pod network is **default-allow**: any pod can talk to any pod.
+That's convenient and dangerous — a compromised frontend can reach your database. A
+**NetworkPolicy** is a firewall expressed in Kubernetes terms. The moment a policy
+*selects* a pod, that pod flips to **default-deny** for the covered direction, and
+only the flows you explicitly allow get through:
+
+```yaml
+spec:
+  podSelector: { matchLabels: { app: db } }
+  ingress:
+  - from:
+    - podSelector: { matchLabels: { app: api } }
+```
+
+This says "pods labeled `db` accept ingress *only* from pods labeled `api`" — least
+privilege for network traffic. NetworkPolicies are enforced by the CNI plugin, which
+is why your choice of CNI matters: not all of them support policies.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-networking-advanced" questions={networkingAdvancedQuiz} />

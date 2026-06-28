@@ -1,0 +1,91 @@
+---
+title: 'Capstone: Ship to Prod'
+description: An end-to-end checklist that ties the whole book together — from container to GitOps-managed production app.
+---
+import Quiz from '../../../components/Quiz';
+import { capstoneQuiz } from '../../../data/production';
+
+Time to put it all together. This capstone is a **checklist you can actually
+follow** to take a stateless web app from your laptop to a resilient production
+deployment. Every step reuses an idea from earlier chapters — that is the point.
+
+## 1. Containerize
+
+Package the app as an immutable **image**. Keep it small, run as a non-root user,
+and tag it with the commit SHA — never `latest` — so every deploy is traceable:
+
+```
+docker build -t registry.example.com/web:$(git rev-parse --short HEAD) .
+docker push registry.example.com/web:...
+```
+
+## 2. Declare the workload
+
+A **Deployment** manages your replicas and gives you rolling updates and
+rollback for free:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: web
+          image: registry.example.com/web:abc1234
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+```
+
+## 3. Expose it
+
+- A **Service** gives the Pods one stable virtual address and load-balances
+  across the healthy ones.
+- An **Ingress** routes external HTTP/HTTPS by host and path to that Service, and
+  terminates TLS.
+
+## 4. Configure without rebuilding
+
+Put non-secret config in a **ConfigMap** and credentials in a **Secret**, then
+mount them as env vars. The image stays the same across dev, staging, and prod —
+only the config changes.
+
+## 5. Set requests, limits, and probes
+
+This is non-negotiable for production. **Requests** let the scheduler place Pods
+and let the HPA compute utilization; **limits** cap blast radius (and prevent
+noisy-neighbor OOMs); **readiness/liveness probes** keep traffic off Pods that
+aren't ready and restart ones that wedge.
+
+## 6. Scale automatically
+
+Add a **HorizontalPodAutoscaler** so replicas track real load, and rely on the
+**Cluster Autoscaler** to grow the node pool when Pods go `Pending`.
+
+## 7. Make it observable
+
+Expose a `/metrics` endpoint for **Prometheus**, ship container stdout via the
+node logging agent, and write **alerting** rules on error rate and latency so you
+hear about trouble before users do.
+
+## 8. Deliver with GitOps
+
+Commit all of these manifests to a repo and let **Argo CD** or **Flux**
+reconcile the cluster to it. Now production is the repo: every change is a
+reviewed PR, every rollback is a `git revert`, and drift heals itself — the
+reconcile loop, end to end.
+
+That checklist *is* Kubernetes in practice: declare desired state, layer in
+safety (probes, limits, autoscaling, observability), and let control loops keep
+reality matched to your intent.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-capstone" questions={capstoneQuiz} />

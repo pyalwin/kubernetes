@@ -1,0 +1,69 @@
+---
+title: Storage (CSI)
+description: CSI drivers, StorageClasses, dynamic provisioning, and PVC-to-PV binding.
+---
+import Quiz from '../../../components/Quiz';
+import { storageQuiz } from '../../../data/advanced';
+
+Containers are ephemeral — when a pod dies, its writable layer vanishes. For
+databases, uploads, and caches you need storage that **outlives the pod**.
+Kubernetes provides that through persistent volumes, and the modern plumbing
+underneath is the **CSI**.
+
+## The CSI — Container Storage Interface
+
+Just as the CNI standardizes networking plugins, the **CSI** (Container Storage
+Interface) standardizes storage. A storage vendor — AWS EBS, Google Persistent Disk,
+Ceph, Portworx — writes a **CSI driver** that runs in the cluster and knows how to
+create, attach, mount, and delete real volumes on its backend. Kubernetes talks to
+every storage system through this one interface, so adding support for a new backend
+means installing a driver, not patching Kubernetes itself.
+
+## PVC → PV binding
+
+Two objects model storage from opposite sides:
+
+- A **PersistentVolume (PV)** is a piece of real storage in the cluster — a specific
+  disk with a size and access mode.
+- A **PersistentVolumeClaim (PVC)** is a *request* for storage by a pod: "I need 10Gi,
+  read-write-once."
+
+Kubernetes **binds** a PVC to a PV that satisfies it, and the pod mounts the PVC. The
+claim is an abstraction: the app author asks for capacity without knowing which
+physical disk backs it. A PV bound to a PVC is exclusively held until the claim is
+released.
+
+## StorageClass and dynamic provisioning
+
+Pre-creating PVs by hand doesn't scale. A **StorageClass** automates it. The class
+names a **provisioner** (a CSI driver) and parameters like disk type:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: fast-ssd }
+provisioner: ebs.csi.aws.com
+parameters: { type: gp3 }
+reclaimPolicy: Delete
+```
+
+Now when a PVC references `storageClassName: fast-ssd`, the provisioner **dynamically
+creates** a matching PV on demand — it calls the CSI driver, which provisions a real
+gp3 disk, then binds it. No admin pre-provisioning, no waiting. This is how a
+StatefulSet can spin up per-pod volumes automatically as it scales.
+
+## Reclaim policies
+
+What happens to the real disk when a PVC is deleted is set by the **reclaim policy**:
+
+- **Delete** — the provisioner destroys the underlying volume too. Convenient for
+  scratch and dev data; dangerous for anything you care about.
+- **Retain** — the PV (and its data) is kept after the claim is gone, so an admin can
+  recover or archive it before manual cleanup.
+
+Choosing `Retain` for stateful data is a cheap insurance policy against an accidental
+`kubectl delete pvc`.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-storage" questions={storageQuiz} />

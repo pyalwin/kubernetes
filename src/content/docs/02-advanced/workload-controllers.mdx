@@ -1,0 +1,60 @@
+---
+title: Workload Controllers
+description: StatefulSet, DaemonSet, Job, and CronJob — picking the right controller for the workload.
+---
+import Quiz from '../../../components/Quiz';
+import KubectlTerminal from '../../../components/KubectlTerminal';
+import { workloadsQuiz, workloadsTerminal } from '../../../data/advanced';
+
+A Deployment is the right tool for stateless web apps: interchangeable pods you
+can scale, roll, and replace freely. But not every workload is stateless or
+long-running. Kubernetes ships several **workload controllers**, each encoding a
+different lifecycle. Choosing the wrong one causes real pain — running a database
+as a Deployment, for example, gives every replica the same identity and no stable
+storage. Learn what each controller guarantees.
+
+## StatefulSet — stable identity and storage
+
+A **StatefulSet** is for workloads where pods are *not* interchangeable: databases,
+message brokers, clustered stores. It provides:
+
+- **Stable, ordered names** — `web-0`, `web-1`, `web-2`, instead of random hashes.
+- **Stable storage** — each pod gets its own PersistentVolumeClaim that follows it
+  across rescheduling, so `web-0` always reattaches to *its* disk.
+- **Ordered, graceful** rollout and scaling — `web-0` is ready before `web-1`
+  starts, which clustered systems with leader election depend on.
+
+## DaemonSet — one pod per node
+
+A **DaemonSet** ensures **exactly one copy of a pod runs on every node** (or every
+node matching a selector). As nodes join the cluster, the DaemonSet schedules onto
+them automatically; as nodes leave, those pods are cleaned up. This is the pattern
+for node-level agents: log collectors (`fluentd`), monitoring agents (`node-exporter`),
+and CNI plugins. You don't pick a replica count — the count *is* the node count.
+
+## Job and CronJob — run to completion and on a schedule
+
+A **Job** runs pods until a specified number **complete successfully**, then stops.
+Use it for batch work: a database migration, a data export, a one-off computation.
+Unlike a Deployment, a Job is *done* when the work is done — it does not restart the
+pod forever. A **CronJob** wraps a Job with a schedule, creating a new Job on a cron
+expression (`"0 2 * * *"` = 2 a.m. daily) for backups, report generation, or cleanup.
+
+## See them in the cluster
+
+Different controllers, different `kubectl` views. Try these:
+
+<KubectlTerminal client:visible id="workloads-term" commands={workloadsTerminal} />
+
+Notice the StatefulSet lists ordered, named pods, while a Job reports `COMPLETIONS`
+rather than a perpetually-running count — the lifecycle difference made visible.
+
+## Choosing
+
+Ask: is the work long-running and interchangeable (Deployment), stateful with
+identity (StatefulSet), per-node (DaemonSet), finite (Job), or scheduled (CronJob)?
+The controller you pick is a statement about the workload's lifecycle.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-workloads" questions={workloadsQuiz} />

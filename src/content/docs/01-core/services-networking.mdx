@@ -1,0 +1,58 @@
+---
+title: Services & Networking
+description: Stable names over disposable Pods — ClusterIP, NodePort, LoadBalancer, kube-proxy, and cluster DNS.
+---
+import Quiz from '../../../components/Quiz';
+import KubectlTerminal from '../../../components/KubectlTerminal';
+import { servicesQuiz, serviceTerminalCommands } from '../../../data/core';
+
+Pods are disposable. A ReplicaSet deletes and recreates them, the scheduler
+moves them between nodes, and each new Pod gets a *new* IP address. So how does
+one app reliably reach another when the target keeps changing addresses? The
+answer is the **Service**: a stable name and virtual IP that sits in front of a
+shifting set of Pods.
+
+## What a Service is
+
+A Service selects a group of Pods with a **label selector** (for example
+`app: web`) and gives them a single, stable identity: a **ClusterIP** (a virtual
+IP that never changes for the life of the Service) and a DNS name. The cluster
+keeps a list of the matching Pods' real IPs — the Service's **endpoints** — and
+updates it automatically as Pods come and go. Clients talk to the stable VIP;
+the cluster load-balances each connection to a healthy backing Pod.
+
+<KubectlTerminal client:visible id="svc-term" commands={serviceTerminalCommands} />
+
+## The Service types
+
+There are three you'll use constantly, each building on the previous:
+
+- **ClusterIP** (the default) — reachable only *inside* the cluster. Perfect for
+  internal communication, like a frontend calling a backend.
+- **NodePort** — opens a fixed port (in the 30000–32767 range) on *every* node,
+  forwarding to the Service. It's the simplest way to reach an app from outside,
+  though rarely used directly in production.
+- **LoadBalancer** — asks the cloud provider for an external load balancer with a
+  public IP that funnels traffic to the NodePort. This is the usual way to expose
+  a service to the internet on a cloud cluster.
+
+## kube-proxy: making the VIP work
+
+A ClusterIP is virtual — no single machine "owns" it. **kube-proxy**, running on
+each node, programs the node's networking (via iptables or IPVS rules) so that
+packets sent to the Service's VIP get rewritten to one of the real endpoint Pod
+IPs. It's the quiet plumbing that turns a stable abstraction into actual routed
+traffic.
+
+## Cluster DNS
+
+You rarely type IPs at all, because every Service gets a DNS name. A Service
+named `web` in namespace `prod` is reachable at `web.prod.svc.cluster.local`, or
+just `web` from within the same namespace. The cluster's DNS add-on (CoreDNS)
+resolves these names to the Service's ClusterIP. So your code connects to
+`http://web` and the layers of indirection — DNS to VIP, VIP to a live Pod —
+happen underneath, surviving every reschedule.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-services" questions={servicesQuiz} />

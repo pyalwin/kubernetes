@@ -1,0 +1,61 @@
+---
+title: Helm
+description: The package manager for Kubernetes — charts, templates, values, and releases.
+---
+import Quiz from '../../../components/Quiz';
+import { helmQuiz } from '../../../data/advanced';
+
+Once you run real workloads, you stop writing one manifest and start writing
+*dozens*: a Deployment, a Service, a ConfigMap, an Ingress, a HorizontalPodAutoscaler,
+and the same set again for staging, for production, for each customer. Copy-pasting
+that YAML and hand-editing the image tag and replica count in each copy is how
+clusters drift and break. **Helm** is the answer: it is the package manager for
+Kubernetes, the apt or npm of your cluster.
+
+## Charts, templates, and values
+
+A Helm package is called a **chart** — a directory with a known layout:
+
+- `Chart.yaml` — metadata (name, version, app version).
+- `templates/` — your manifests, but with Go template placeholders instead of
+  hard-coded values: `replicas: {{ .Values.replicaCount }}`.
+- `values.yaml` — the default configuration that fills those placeholders.
+
+At install time Helm **renders** the templates against the values to produce plain
+Kubernetes YAML, then sends it to the API server. The win is that the *structure*
+of your app lives in `templates/` once, while everything that changes per
+environment lives in `values.yaml`. To deploy to production you don't fork the
+manifests — you pass a different values file:
+
+```bash
+helm install myapp ./mychart -f values-prod.yaml
+```
+
+## Releases: installs you can track and undo
+
+When you install a chart you create a named **release**. Helm records every
+install and upgrade as a numbered **revision**, storing that history in the
+cluster. That bookkeeping is what makes Helm safe:
+
+```bash
+helm install web ./mychart          # revision 1
+helm upgrade web ./mychart --set image.tag=2.0   # revision 2
+helm rollback web 1                  # back to revision 1, one command
+```
+
+Because each revision is a complete snapshot of the rendered manifests, a bad
+`helm upgrade` is never a dead end — `helm rollback` re-applies the last good
+revision. You can also `helm list` releases and `helm uninstall` to remove every
+object a release created, so you never hunt down stray resources by hand.
+
+## Why templating beats copy-paste
+
+The deeper point: templating turns configuration into *data*. A reviewer reads
+one `values.yaml` diff instead of comparing five near-identical manifests. Shared
+charts (from repositories like Artifact Hub) let you install Postgres or
+cert-manager with vetted defaults instead of authoring hundreds of lines yourself.
+Helm makes deployments repeatable, parameterized, and reversible.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-helm" questions={helmQuiz} />

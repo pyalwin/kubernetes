@@ -1,0 +1,67 @@
+---
+title: Observability
+description: Logs, metrics, and traces — Prometheus, PromQL, alerting, and how Kubernetes exposes signals.
+---
+import KubectlTerminal from '../../../components/KubectlTerminal';
+import Quiz from '../../../components/Quiz';
+import { observabilityTerminal, observabilityQuiz } from '../../../data/production';
+
+When a system is healthy you barely think about it; when it is broken at 3am you
+need to answer *what changed* fast. **Observability** is the property that lets
+you ask new questions of a running system without shipping new code, and it rests
+on three pillars.
+
+## The three pillars
+
+- **Logs** are timestamped, discrete events — `GET /api/orders 200 27ms`,
+  `FATAL config missing`. They are rich on detail but expensive to search at
+  scale.
+- **Metrics** are numeric time series sampled at intervals — CPU, request rate,
+  error ratio. They are cheap to store and perfect for trends, dashboards, and
+  alert thresholds.
+- **Traces** follow a *single request* as it hops across services, so you can see
+  which hop spent the `812ms`. Logs tell you what happened, metrics tell you how
+  much and how often, traces tell you where.
+
+## Prometheus and the pull model
+
+The de-facto metrics stack is **Prometheus**. Crucially it is **pull-based**:
+each workload exposes a plain HTTP `/metrics` endpoint, and Prometheus *scrapes*
+those endpoints on a fixed interval, discovering targets automatically from the
+Kubernetes API. Pull means Prometheus always knows whether a target is up (a
+failed scrape is itself a signal) and apps never need to know where the
+monitoring system lives.
+
+You query the stored series with **PromQL**. A couple of everyday examples:
+
+```promql
+# per-second request rate over 5m, summed by route
+sum(rate(http_requests_total[5m])) by (route)
+
+# error ratio
+sum(rate(http_requests_total{code=~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+```
+
+**Alerting** is built on the same expressions: an alerting rule fires when a
+PromQL query stays true for a duration (e.g. error ratio `> 5%` for 10 minutes),
+and Alertmanager routes the page to the right team.
+
+## How Kubernetes exposes signals
+
+Kubernetes meets this model halfway. The **metrics-server** collects basic CPU
+and memory per Pod (what `kubectl top` and the HPA read). Application metrics
+come from your own `/metrics` endpoint. **Logs** follow a node-agent
+architecture: each container writes to stdout/stderr, the kubelet captures it,
+and a per-node agent (Fluent Bit, Vector, …) tails those files and ships them to
+a central store — so log collection scales with nodes, not with Pods.
+
+## Try it
+
+`kubectl top` reads live metrics; `kubectl logs` reads an app's stdout. Try them:
+
+<KubectlTerminal client:visible id="obs-term" commands={observabilityTerminal} />
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-observability" questions={observabilityQuiz} />

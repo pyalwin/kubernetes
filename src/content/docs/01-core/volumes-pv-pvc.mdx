@@ -1,0 +1,61 @@
+---
+title: Volumes, PV & PVC
+description: Durable storage in an ephemeral world — Volumes, PersistentVolumes, PersistentVolumeClaims, and access modes.
+---
+import Quiz from '../../../components/Quiz';
+import { volumesQuiz } from '../../../data/core';
+
+A container's filesystem is **ephemeral**. The thin writable layer on top of the
+image lives and dies with the container — restart it and everything written
+there is gone. That's fine for stateless apps, but a database, a file upload
+service, or anything that must *remember* needs storage that outlives a single
+container. Kubernetes layers three concepts to provide it: Volumes, then
+PersistentVolumes and PersistentVolumeClaims.
+
+## Volumes: storage tied to a Pod
+
+A **Volume** is storage attached to a Pod and mounted into its containers. Unlike
+the container's writable layer, a Volume survives container *restarts* within the
+Pod, and it's how containers in a Pod share files. There are many volume types:
+`emptyDir` (scratch space that lasts as long as the Pod), `configMap`/`secret`
+(injecting config), and cloud disks. But a plain Volume's lifetime is still tied
+to the **Pod** — delete the Pod and an `emptyDir` is gone. For storage that
+outlives Pods entirely, you need PersistentVolumes.
+
+## PersistentVolume and PersistentVolumeClaim
+
+Kubernetes splits durable storage into two objects to separate *who provides
+storage* from *who consumes it*:
+
+- A **PersistentVolume (PV)** is a piece of storage in the cluster — a real disk,
+  an NFS share, a cloud volume — provisioned by an administrator or dynamically
+  by a StorageClass. It exists independently of any Pod.
+- A **PersistentVolumeClaim (PVC)** is a *request* for storage made by a user: "I
+  need 10Gi that I can read and write." The Pod references the PVC, not the disk.
+
+Kubernetes **binds** a PVC to a suitable PV (matching size and access mode), and
+from then on the Pod uses the claim. This indirection means application authors
+ask for storage abstractly without knowing whether it's backed by AWS EBS, GCE
+PD, or NFS — the same decoupling-by-request idea you saw with Services and Pods.
+
+## Access modes
+
+When you request storage you specify an **access mode** describing how it can be
+mounted:
+
+- **ReadWriteOnce (RWO)** — read/write by a single node. The most common; fits
+  most block storage like cloud disks.
+- **ReadOnlyMany (ROX)** — read-only by many nodes.
+- **ReadWriteMany (RWX)** — read/write by many nodes at once, which only some
+  backends (like NFS) support.
+
+## The bind in practice
+
+You create a PVC; Kubernetes finds or dynamically provisions a matching PV and
+binds them; your Pod mounts the PVC like any volume. If the Pod is rescheduled to
+another node, the storage follows the claim — your data persists across the churn
+that Pods are designed to endure.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-volumes" questions={volumesQuiz} />
