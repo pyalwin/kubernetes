@@ -33,26 +33,30 @@ import { firstPodsTerminal } from '@/data/terminals';
   }}
 >
 
-<Callout type="note" title="Before you begin">
-This book is about Kubernetes, and Kubernetes sits squarely on top of
-**containers**. The chapters ahead assume you've at least met one — run
-something like `docker run nginx`, or roughly know what an *image* and a
-*container* are — and that you're comfortable at a command line.
+A **container** is the thing Kubernetes spends its entire life managing, so we
+need a one-paragraph picture of it before anything else — and one paragraph is
+genuinely all it takes to start. A container is a single program packaged
+together with everything it needs to run — its code, its libraries, its files —
+sealed into one isolated, portable bundle that behaves the same on your laptop,
+in a test pipeline, or on a server in a datacenter. You start one with a single
+command; something like `docker run nginx` fetches a packaged web server and
+runs it. That sentence is the entire amount of container knowledge this chapter
+needs.
 
-If those are brand-new ideas, don't push through on willpower. Take ten minutes
-with a containers primer first (Docker's *Get Started* guide, or any "what is a
-container?" explainer), **or** skip ahead to Chapter 2, *What a Container
-Actually Is*, and come back here. Orchestration only makes sense once a
-container does — so it's worth getting that footing first.
+<Callout type="note" title="New to containers? You're in the right place">
+You need **no** prior Kubernetes experience, and only the rough picture above —
+*"a container is a packaged, isolated program."* We build everything else from
+scratch as we go. A little comfort at a command line helps; nothing more. When
+you're curious what's actually inside that "bundle," Chapter 2, *What a Container
+Actually Is*, takes one apart and shows there's no magic in it — just a Linux
+process wearing a disguise.
 </Callout>
 
-Maybe you've run a container before: `docker run nginx`, and a web server is
-live. It worked the first time, and it felt like the hard part was over.
-
-It wasn't. Running a container is easy in the way that lighting one candle is
-easy. The hard part is keeping a thousand candles lit, in the wind, while
-someone periodically walks through the room knocking them over — and never being
-the person who has to notice and relight each one.
+So: running *one* container is easy. One command, and a web server is live; it
+feels like the hard part is over. It isn't — running one container is easy in the
+way lighting one candle is easy. The hard part is keeping a thousand candles lit,
+in the wind, while someone periodically walks through the room knocking them
+over — and never being the person who has to notice and relight each one.
 
 So let's not start with a definition of Kubernetes. Definitions of Kubernetes
 are uniformly terrible; they use the word "orchestration" to explain the word
