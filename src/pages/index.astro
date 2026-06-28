@@ -1,0 +1,304 @@
+---
+import Layout from '@/layouts/Layout.astro';
+import BrandLogo from '@/components/BrandLogo.astro';
+import { getCollection } from 'astro:content';
+
+const chapters = (await getCollection('chapters'))
+  .filter((c) => c.id !== '_test')
+  .map((c) => ({
+    num: c.data.chapterNumber,
+    title: c.data.title,
+    href: `/chapters/${c.id}`,
+  }))
+  .sort((a, b) => a.num - b.num);
+
+const firstReadable = chapters[0];
+---
+
+<Layout title="Kubernetes: Under the Hood">
+  <article class="spread">
+    <section class="title-page">
+      <div class="cover-brand">
+        <BrandLogo size="display" />
+      </div>
+
+      <h1 class="title">
+        <span class="title-word title-word--accent">Kubernetes</span>
+        <span class="title-word title-word--series">Under the Hood</span>
+      </h1>
+
+      <p class="subtitle">
+        A book in a series about systems from the inside.
+        Read in the page, run the commands, break things on purpose.
+      </p>
+
+      <hr class="rule" />
+
+      <blockquote class="epigraph">
+        Kubernetes is not magic. It is a few hundred control loops, each
+        quietly dragging reality back toward what you declared.
+      </blockquote>
+
+      <hr class="rule" />
+
+      {firstReadable && (
+        <a class="begin" href={firstReadable.href}>
+          <span class="begin-label">
+            Begin reading
+            <span class="begin-arrow" aria-hidden="true">&rarr;</span>
+          </span>
+          <span class="begin-detail">
+            Chapter {String(firstReadable.num).padStart(2, '0')} &middot; {firstReadable.title}
+          </span>
+        </a>
+      )}
+    </section>
+
+    <section class="contents-page">
+      <p class="eyebrow eyebrow--right">Contents</p>
+
+      <ol class="toc">
+        {chapters.map((c) => {
+          const num = String(c.num).padStart(2, '0');
+          return (
+            <li class="toc-row">
+              <a class="toc-link" href={c.href}>
+                <span class="toc-num">{num}</span>
+                <span class="toc-title">{c.title}</span>
+                <span class="toc-leader" aria-hidden="true"></span>
+                <span class="toc-arrow" aria-hidden="true">&rarr;</span>
+              </a>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  </article>
+
+  <p class="colophon">
+    Diagrams and the kubectl sandbox run in your browser
+    &middot; read at your own pace
+  </p>
+</Layout>
+
+<style>
+  .spread {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 5.5rem 2.5rem 4rem;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 4.5rem;
+    position: relative;
+  }
+  .spread::before {
+    content: '';
+    position: absolute;
+    top: 5.5rem;
+    bottom: 4rem;
+    left: 50%;
+    width: 1px;
+    background: var(--color-rule);
+    transform: translateX(-50%);
+  }
+  @media (max-width: 880px) {
+    .spread {
+      grid-template-columns: 1fr;
+      padding: 3.5rem 1.5rem 2.5rem;
+      row-gap: 3rem;
+    }
+    .spread::before { display: none; }
+  }
+
+  .title-page { padding-right: 1.5rem; }
+  .contents-page { padding-left: 1.5rem; }
+  @media (max-width: 880px) {
+    .title-page, .contents-page { padding: 0; }
+  }
+
+  .eyebrow {
+    font-family: var(--font-sans);
+    font-size: 0.7rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    color: var(--color-ink-soft);
+    margin: 0 0 2.25rem;
+  }
+  .eyebrow--right { margin-bottom: 1.75rem; }
+
+  .cover-brand {
+    margin: 0 0 2.2rem;
+  }
+
+  .title {
+    font-family: var(--font-serif);
+    font-weight: 400;
+    font-size: clamp(2.75rem, 6vw, 4.75rem);
+    line-height: 0.98;
+    letter-spacing: -0.025em;
+    color: var(--color-ink);
+    margin: 0 0 1.6rem;
+    display: flex;
+    flex-direction: column;
+  }
+  .title-word { display: block; }
+  .title-word--series {
+    margin-top: 0.75rem;
+    font-family: var(--font-sans);
+    font-size: clamp(0.68rem, 0.95vw, 0.82rem);
+    font-style: normal;
+    font-weight: 600;
+    line-height: 1.2;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: var(--color-ink-soft);
+  }
+  .title-word--accent {
+    font-style: italic;
+    color: var(--color-accent);
+    font-weight: 500;
+  }
+
+  .subtitle {
+    font-family: var(--font-serif);
+    font-size: 1.1rem;
+    line-height: 1.55;
+    color: var(--color-ink-soft);
+    margin: 0;
+    max-width: 30ch;
+  }
+
+  .rule {
+    border: 0;
+    border-top: 1px solid var(--color-rule);
+    width: 3.5rem;
+    margin: 2.25rem 0;
+  }
+
+  .epigraph {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 1.02rem;
+    line-height: 1.55;
+    color: var(--color-ink);
+    margin: 0;
+    padding: 0 0 0 0.1rem;
+    max-width: 32ch;
+    border: 0;
+  }
+
+  .begin {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    text-decoration: none;
+    color: var(--color-ink);
+    transition: color 0.2s ease;
+  }
+  .begin:hover { color: var(--color-accent); }
+  .begin-label {
+    font-family: var(--font-serif);
+    font-size: 1.25rem;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.55rem;
+  }
+  .begin-arrow {
+    display: inline-block;
+    transition: transform 0.2s ease;
+  }
+  .begin:hover .begin-arrow { transform: translateX(4px); }
+  .begin-detail {
+    font-family: var(--font-sans);
+    font-size: 0.72rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--color-ink-soft);
+  }
+
+  .toc {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .toc-row {
+    padding: 0.85rem 0;
+    border-top: 1px solid var(--color-rule);
+  }
+  .toc-row:last-child { border-bottom: 1px solid var(--color-rule); }
+
+  .toc-link {
+    display: flex;
+    align-items: baseline;
+    gap: 0.85rem;
+    text-decoration: none;
+    color: var(--color-ink);
+    transition: color 0.2s ease;
+  }
+  .toc-link:hover { color: var(--color-accent); }
+
+  .toc-num {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--color-ink-soft);
+    width: 1.6rem;
+    flex-shrink: 0;
+  }
+
+  .toc-title {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 1.15rem;
+    font-weight: 500;
+    flex-shrink: 0;
+  }
+
+  .toc-leader {
+    flex: 1;
+    border-bottom: 1px dotted var(--color-rule);
+    margin: 0 0.45rem 0.4rem;
+    min-width: 1.5rem;
+    align-self: flex-end;
+  }
+
+  .toc-arrow {
+    font-family: var(--font-serif);
+    font-size: 0.95rem;
+    color: var(--color-ink-soft);
+    flex-shrink: 0;
+    transition: transform 0.2s ease, color 0.2s ease;
+  }
+  .toc-link:hover .toc-arrow {
+    color: var(--color-accent);
+    transform: translateX(3px);
+  }
+
+  .colophon {
+    max-width: 1180px;
+    margin: 3rem auto 4rem;
+    padding: 1.75rem 2.5rem 0;
+    border-top: 1px solid var(--color-rule);
+    font-family: var(--font-sans);
+    font-size: 0.74rem;
+    font-weight: 500;
+    color: var(--color-ink-soft);
+    text-align: center;
+    letter-spacing: 0.04em;
+  }
+  .colophon a {
+    color: var(--color-ink-soft);
+    text-decoration: underline;
+    text-decoration-color: var(--color-rule);
+    text-underline-offset: 3px;
+    transition: color 0.2s ease;
+  }
+  .colophon a:hover {
+    color: var(--color-accent);
+    text-decoration-color: var(--color-accent);
+  }
+</style>

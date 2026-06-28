@@ -25,21 +25,53 @@ export default function KubectlTerminal({ id, commands, prompt = '$' }: KubectlT
   }
 
   return (
-    <div className="kubectl-terminal" data-testid={`term-${id}`}
-         style={{ background: '#0d1117', color: '#c9d1d9', padding: 12, borderRadius: 8, fontFamily: 'monospace' }}>
+    <div
+      className="kubectl-terminal font-mono"
+      data-testid={`term-${id}`}
+      style={{
+        background: 'var(--color-ink)',
+        color: 'var(--color-page)',
+        padding: '14px 16px',
+        borderRadius: 8,
+        fontSize: 13.5,
+        lineHeight: 1.6,
+      }}
+    >
       {history.map((line, i) => (
-        <pre key={i} style={{ margin: 0, whiteSpace: 'pre-wrap', color: line.kind === 'input' ? '#58a6ff' : '#c9d1d9' }}>
+        <pre
+          key={i}
+          style={{
+            margin: 0,
+            background: 'transparent',
+            border: 'none',
+            padding: 0,
+            whiteSpace: 'pre-wrap',
+            color:
+              line.kind === 'input'
+                ? 'var(--color-page)'
+                : 'color-mix(in srgb, var(--color-page) 70%, transparent)',
+          }}
+        >
           {line.text}
         </pre>
       ))}
-      <div style={{ display: 'flex', gap: 6 }}>
-        <span style={{ color: '#58a6ff' }}>{prompt}</span>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+        <span aria-hidden="true" style={{ opacity: 0.85 }}>{prompt}</span>
         <input
           aria-label="terminal input"
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') run(); }}
-          style={{ flex: 1, background: 'transparent', border: 'none', color: '#c9d1d9', outline: 'none', fontFamily: 'monospace' }}
+          placeholder="type a kubectl command, then Enter"
+          style={{
+            flex: 1,
+            background: 'transparent',
+            border: 'none',
+            color: 'var(--color-page)',
+            outline: 'none',
+            fontFamily: 'inherit',
+            fontSize: 'inherit',
+          }}
         />
       </div>
     </div>

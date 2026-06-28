@@ -1,0 +1,312 @@
+---
+title: "Why Orchestration Exists"
+chapterNumber: 1
+summary: "A container runs one program on one machine. Production needs many programs on many machines that stay up while machines die. This chapter earns Kubernetes by trying to run a service by hand and watching it fall apart — then naming the one idea that fixes it."
+readingTime: "24 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { controlPlaneNodes } from '@/data/diagrams';
+import { firstPodsTerminal } from '@/data/terminals';
+
+<ChapterReader chapterId="01-why-orchestration">
+
+<Section
+  id="premise"
+  title="The premise"
+  brief={{
+    problem: "A container runs one program on one machine. Production is many programs on many machines that must survive machines dying.",
+    mechanism: "This chapter tries to run a service by hand, watches each chore become unmanageable, and names the idea that automates them.",
+    takeaway: "Kubernetes is not a bigger container runtime; it is the machine that keeps a declared state true.",
+  }}
+  quiz={{
+    question: "By the end of this chapter, you should be able to describe Kubernetes as...",
+    options: [
+      { text: "A faster way to run Docker containers." },
+      { text: "A machine that continuously makes reality match a declared desired state.", correct: true },
+      { text: "A cloud provider." },
+    ],
+  }}
+>
+
+You already know how to run a container. `docker run nginx` and a web server is
+live. It worked the first time you tried it, and it felt like the hard part was
+over.
+
+It wasn't. Running a container is easy in the way that lighting one candle is
+easy. The hard part is keeping a thousand candles lit, in the wind, while
+someone periodically walks through the room knocking them over — and never being
+the person who has to notice and relight each one.
+
+So let's not start with a definition of Kubernetes. Definitions of Kubernetes
+are uniformly terrible; they use the word "orchestration" to explain the word
+"orchestration." Let's instead try to run a real service the manual way, take on
+each chore as it appears, and feel exactly where it stops being possible. The
+features of Kubernetes will then arrive not as vocabulary to memorize but as the
+obvious answer to a problem you just felt.
+
+There is one idea waiting at the end of this. You may already know its name.
+Hold on for it.
+
+</Section>
+
+<Section
+  id="by-hand"
+  title="Running it by hand"
+  brief={{
+    problem: "One container on one box dies when the process crashes, the box reboots, or traffic outgrows it — and a human has to be watching to fix it.",
+    mechanism: "Each fix (restart, reschedule, scale, route) is a loop a tired human runs badly; the work grows with machines × services.",
+    cost: "Human attention does not scale and is never on call at 3am.",
+    takeaway: "Every manual recovery chore is really a loop begging to be automated.",
+  }}
+  quiz={{
+    question: "What do restarting a crashed process, rescheduling off a dead node, and scaling to traffic all have in common?",
+    options: [
+      { text: "They each require a bigger machine." },
+      { text: "Each is a loop that watches reality and acts to restore an intended state.", correct: true },
+      { text: "They are only needed in the cloud." },
+    ],
+  }}
+>
+
+Ship your container to one server. Day one is fine. Then the failures begin, and
+they are not exotic — they are Tuesday.
+
+- **The process crashes.** A bug, an out-of-memory kill, a bad deploy. Your
+  service is down until *someone notices* and runs the container again. So you
+  write a little shell loop that restarts it. Fine.
+- **The server reboots.** Kernel update, hardware blip. Your restart loop reboots
+  with it and is gone. So you make it a `systemd` unit. Fine.
+- **The whole machine dies.** Now `systemd` can't help — it died too. You need
+  the container to come back *on a different machine*. Which machine? Is there
+  room? Who decides?
+- **Traffic triples.** One copy isn't enough. You start three, on three boxes,
+  and now something has to spread requests across them and stop sending traffic
+  to the one that just crashed.
+- **You deploy v2.** You'd like to replace the three copies *without* a window
+  where the site is down — a few at a time, rolling back instantly if v2 is bad.
+
+Notice the shape. Every single item is the same move: *look at what is true,
+compare it to what should be true, and take an action to close the gap.* The
+process should be running — it isn't — start it. Three copies should exist — two
+do — start one. You have been hand-cranking a control loop, badly, because you
+have to sleep.
+
+<Callout type="note">
+The work here scales with **machines × services**. Ten services on twenty nodes
+is two hundred little loops, each with its own failure modes, all depending on a
+human being awake. This is the wall everyone hits, and it is the reason
+orchestrators exist.
+</Callout>
+
+</Section>
+
+<Section
+  id="desired-state"
+  title="Declaring the outcome"
+  brief={{
+    problem: "Step-by-step instructions are fragile: if a step fails halfway, the system is left in an unknown state with no obvious recovery.",
+    mechanism: "Declare the desired end state instead. There is no 'halfway' to a description — only a gap to be closed.",
+    takeaway: "Declarative desired state is what makes automated recovery tractable.",
+  }}
+  quiz={{
+    question: "Why is a declarative 'desired state' more robust than an imperative script in a system where anything can fail at any moment?",
+    options: [
+      { text: "Declarative configs are written in YAML, which is faster to parse." },
+      { text: "A description has no half-finished state — the system can always just compare and act to close the gap, however it got knocked off course.", correct: true },
+      { text: "Imperative scripts cannot express what you want." },
+    ],
+  }}
+>
+
+Here is the pivot that makes automation possible. Stop writing *instructions* and
+start writing a *description of the desired result*.
+
+Imperative, the way you'd script it by hand:
+
+```bash
+# do this, then this, then this...
+start_container web on node-3
+if traffic_high: start_container web on node-4
+if node-3 down: start_container web somewhere else
+```
+
+The trouble: what happens if the script dies on line two? Now the world is in a
+state your script never anticipated, and "run it again" might start a fourth
+copy or none. Imperative steps assume nothing fails. In a fleet of machines,
+*something is always failing.*
+
+Declarative, the way Kubernetes wants it:
+
+```yaml
+# this is simply true. make it so, and keep it so.
+kind: Deployment
+spec:
+  replicas: 3
+  image: web:v2
+```
+
+This says nothing about *how*. It is a statement of fact about the world you
+want: three copies of `web:v2`, always. There is no "halfway" to that sentence.
+Whatever happens — a crash, a dead node, a botched deploy — the system's job is
+unchanged: look at reality, compare it to this, and act. That is a job a machine
+can do tirelessly, and it is the whole reason the next idea works.
+
+</Section>
+
+<Section
+  id="control-loop"
+  title="The control loop"
+  brief={{
+    problem: "A declared desired state is useless unless something continuously enforces it.",
+    mechanism: "A control loop observes actual state, compares it to desired, acts to reduce the difference, and repeats forever.",
+    cost: "Enforcement is never 'done' — it costs continuous watching and reconciliation work.",
+    takeaway: "Self-healing is not a feature bolted on; it is what a control loop does by definition.",
+  }}
+  quiz={{
+    question: "You delete a Pod that a Deployment manages. Moments later an identical one appears. Why?",
+    options: [
+      { text: "Kubernetes logged an error and gave up." },
+      { text: "A controller compared actual (2 Pods) to desired (3 Pods) and created one to close the gap.", correct: true },
+      { text: "Deleting Pods is not allowed." },
+    ],
+  }}
+>
+
+The mechanism that enforces desired state is the **control loop**, and it is so
+simple it feels like it shouldn't work:
+
+1. **Observe** the actual state of the world.
+2. **Compare** it to the desired state you declared.
+3. **Act** to reduce the difference.
+4. Go to 1. Forever.
+
+That's it. A piece of software that runs this loop for one kind of thing is
+called a **controller**. The controller responsible for your three replicas does
+nothing but ask, over and over, "are there three healthy copies?" When the
+answer is no — a Pod crashed, a node vanished — it creates one. You wrote no
+recovery code. You declared an outcome, and a loop maintains it.
+
+This reframes a phrase you'll hear constantly. Kubernetes "self-heals" not
+because it is intelligent, but because *healing is just the loop noticing a gap
+and closing it.* Kill a Pod and watch it return: you are not seeing magic, you
+are seeing step 3.
+
+<Callout type="tip">
+Hold onto this loop. Almost every component you meet for the rest of this book —
+the thing managing replicas, the thing managing nodes, the thing wiring up
+networking — is another instance of exactly this four-step loop, pointed at a
+different slice of the world.
+</Callout>
+
+</Section>
+
+<Section
+  id="control-plane"
+  title="Where the loops live"
+  brief={{
+    problem: "The loops need a shared source of truth for 'desired' and 'actual', and a place to run.",
+    mechanism: "The control plane: an API server as the single front door, and etcd as the consistent store of all state.",
+    takeaway: "Everything talks to the API server; the API server is backed by etcd. That is the spine of the cluster.",
+  }}
+  quiz={{
+    question: "Where does a controller read the desired state and write the actual state it observes?",
+    options: [
+      { text: "Directly to each node's disk." },
+      { text: "Through the API server, which persists cluster state in etcd.", correct: true },
+      { text: "In a config file on your laptop." },
+    ],
+  }}
+>
+
+If a dozen control loops are all enforcing desired state, they need two things:
+somewhere to read what *desired* means, and somewhere to record what they
+*observe*. That shared brain is the **control plane**.
+
+You'll meet every part of it in Chapter 5. For now, just the spine — click each
+piece:
+
+<Figure number="1.1" caption="The two pieces every control loop depends on. The API server is the only door into the cluster; etcd is the cluster's memory.">
+  <Diagram client:visible id="cp-intro" title="The control plane, minimal" nodes={controlPlaneNodes} />
+</Figure>
+
+The **API server** is the single front door. You don't edit cluster state
+directly, and neither do the controllers — *everyone* goes through the API
+server. That one rule is why the system is observable and secure: there is one
+place where every change is validated, authorized, and recorded.
+
+Behind it, **etcd** is the cluster's memory: a consistent, replicated key-value
+store holding both halves of the picture — what you declared, and what currently
+exists. When a controller "compares desired to actual," this is what it reads.
+When a node dies and its Pods need rescheduling, the gap becomes visible *here*,
+and some loop springs into action.
+
+</Section>
+
+<Section
+  id="try-it"
+  title="Try it"
+  brief={{
+    problem: "Reading about loops is not the same as watching the cluster report its own state.",
+    mechanism: "A simulated kubectl talks to the API server's view of the world and prints what it sees.",
+    takeaway: "kubectl is just a polite client of the API server — the same front door the controllers use.",
+  }}
+  quiz={{
+    question: "When you run `kubectl get pods`, where does the answer come from?",
+    options: [
+      { text: "kubectl scans every node over SSH." },
+      { text: "kubectl asks the API server, which reports the state stored in etcd.", correct: true },
+      { text: "It is hard-coded into kubectl." },
+    ],
+  }}
+>
+
+`kubectl` is the tool you'll spend the rest of this book in. It is not special —
+it is just a well-mannered client that makes requests to the API server, exactly
+as the controllers do. Asking the cluster what it's running is the most basic
+thing you can do, so start there.
+
+This terminal is simulated: it returns the real shape of `kubectl` output without
+needing a cluster. Try `kubectl get nodes` and `kubectl get pods`.
+
+<Figure number="1.2" caption="Asking the API server what exists. Every kubectl command is a request through that same front door.">
+  <KubectlTerminal client:visible id="ch1-term" commands={firstPodsTerminal} />
+</Figure>
+
+Each line came back through the API server reading etcd. You didn't reach a
+single node directly. That indirection — one front door, one source of truth,
+many loops reconciling against it — *is* Kubernetes. The rest is detail, and the
+detail is where it gets good.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The framing in this chapter — declarative desired state enforced by
+reconciling controllers — is the foundation the official documentation builds
+everything else on.
+
+- **Kubernetes Documentation — *What is Kubernetes?* and *Kubernetes
+  Components*.** The canonical description of the control plane, the API server,
+  and etcd. `kubernetes.io/docs/concepts/overview/`
+- **Brewer, *Kubernetes and the Path to Cloud Native* (2015).** The control-loop
+  and desired-state philosophy from one of the people who built the ideas behind
+  it.
+- **Burns, Grant, Oppenheimer, Brewer & Wilkes, *Borg, Omega, and Kubernetes*
+  (ACM Queue, 2016).** How a decade of running control loops at Google became
+  Kubernetes — the lineage of the reconciliation model.
+
+Next chapter: we drop one level down and ask what a container *actually is* —
+because before the control plane can schedule one, the Linux kernel has to
+make one.
+
+</Section>
+
+</ChapterReader>

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Databases: Under the Hood">
+  <rect width="128" height="128" rx="28" fill="#111111" />
+  <g fill="none" stroke="#fdfdfb" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M31 78 L48 48 H80 L97 78" />
+    <path d="M39 78 H89" />
+    <path d="M49 94 H79" />
+    <path d="M56 62 H72" />
+  </g>
+</svg>

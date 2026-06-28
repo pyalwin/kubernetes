@@ -1,29 +1,40 @@
 {
-  "name": "kubernetes-book",
+  "name": "kubernetes-under-the-hood",
   "type": "module",
   "version": "0.1.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
+    "astro": "astro",
     "test": "vitest run",
     "test:watch": "vitest"
   },
+  "overrides": {
+    "vite": "^7"
+  },
   "dependencies": {
-    "@astrojs/react": "^3.6.0",
-    "@astrojs/starlight": "^0.28.0",
-    "astro": "^4.15.0",
-    "react": "^18.3.0",
-    "react-dom": "^18.3.0"
+    "@astrojs/check": "^0.9.9",
+    "@astrojs/mdx": "^6.0.3",
+    "@astrojs/react": "^5.0.7",
+    "@tailwindcss/vite": "^4.3.1",
+    "astro": "^6.4.7",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "tailwindcss": "^4.3.1",
+    "typescript": "^6.0.3"
   },
   "devDependencies": {
-    "@testing-library/jest-dom": "^6.4.0",
-    "@testing-library/react": "^16.0.0",
-    "@types/react": "^18.3.0",
-    "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.0",
-    "jsdom": "^25.0.0",
-    "typescript": "^5.5.0",
-    "vitest": "^2.1.0"
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "jsdom": "^29.1.1",
+    "vitest": "^4.1.9"
   }
 }
