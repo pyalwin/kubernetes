@@ -1,0 +1,281 @@
+---
+title: "Packaging Apps with Helm"
+chapterNumber: 13
+summary: "One app is never one YAML file — it's a Deployment, a Service, a ConfigMap, an Ingress, and the same set again for staging and prod. Hand-editing copies is how clusters drift and break. This chapter feels that pain, then earns Helm: a package manager that turns a pile of manifests into one installable, upgradeable, reversible unit."
+readingTime: "22 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+
+<ChapterReader chapterId="13-packaging-with-helm">
+
+<Section
+  id="the-pile"
+  title="The pile of YAML"
+  brief={{
+    problem: "A real app is a handful of related manifests, and you need the same set for dev, staging, and prod — differing only in a few values.",
+    mechanism: "Hand-copying and editing each file per environment is manual, error-prone, and drifts the moment someone fixes one copy but not the others.",
+    cost: "Configuration sprawl: N environments × M manifests of nearly-identical YAML nobody can diff at a glance.",
+    takeaway: "An application is a unit, but plain manifests give you no way to package, version, or parameterize that unit.",
+  }}
+  quiz={{
+    question: "What is the core problem with copy-pasting an app's manifests once per environment?",
+    options: [
+      { text: "YAML is too slow for the API server to parse." },
+      { text: "The copies drift apart and there is no single, versioned, parameterized definition of the app.", correct: true },
+      { text: "Kubernetes forbids more than one Deployment per app." },
+    ],
+  }}
+>
+
+Up to now you've applied one manifest at a time. Real apps don't arrive that way.
+Ship a modest web service and you're suddenly holding a **Deployment** (the pods),
+a **Service** (a stable address for them), a **ConfigMap** (its settings), a
+**Secret** (its credentials), and an **Ingress** (its public URL). Five files that
+only make sense *together* — that's the application.
+
+Now run it in three places. Development wants one replica and a debug log level.
+Staging wants two replicas and a staging database URL. Production wants five
+replicas, a real database, and a real hostname. The *shape* is identical across all
+three; only a handful of values change.
+
+The obvious move — copy the five files into `dev/`, `staging/`, and `prod/`, then
+hand-edit the replica count and the image tag in each — is a trap. Fifteen files
+now, all nearly identical. Someone fixes a typo in the prod Service and forgets the
+other two. Three weeks later staging behaves differently from prod and nobody knows
+why, because the directories have silently **drifted**.
+
+<Callout type="note">
+The pain scales with **environments × manifests**. The files aren't really
+different documents — they're one document with three sets of values poured into
+it. You're managing copies when you want to manage *one definition plus its
+differences.*
+</Callout>
+
+You don't have a YAML problem. You have a packaging problem: there's no unit you
+can name, version, hand to a teammate, install, and later upgrade or undo as a
+whole. That unit is what Helm gives you.
+
+</Section>
+
+<Section
+  id="charts"
+  title="The chart: structure once, values apart"
+  brief={{
+    problem: "You need one definition of an app's shape that can be filled with different values per environment.",
+    mechanism: "A Helm chart is a directory: templates/ holds manifests with placeholders, values.yaml holds the defaults that fill them, Chart.yaml holds metadata.",
+    takeaway: "Templating turns configuration into data: the app's structure lives once in templates/, and everything that varies lives in values.",
+  }}
+  quiz={{
+    question: "In a Helm chart, where does the part that changes between environments live?",
+    options: [
+      { text: "Duplicated inside each template file." },
+      { text: "In values.yaml (and per-environment values files), which fill the placeholders in the templates.", correct: true },
+      { text: "It cannot change between environments." },
+    ],
+  }}
+>
+
+Helm is the **package manager for Kubernetes** — the `apt` or `npm` of your
+cluster. Its package is called a **chart**, and a chart is just a directory with a
+known layout:
+
+```
+mychart/
+  Chart.yaml      # metadata: name, version, app version
+  values.yaml     # default configuration
+  templates/      # manifests, with placeholders
+    deployment.yaml
+    service.yaml
+    ingress.yaml
+```
+
+The trick is in `templates/`. Instead of a hard-coded replica count, a template
+leaves a hole to be filled:
+
+```yaml
+# templates/deployment.yaml
+spec:
+  replicas: {{ .Values.replicaCount }}
+  template:
+    spec:
+      containers:
+        - image: "{{ .Values.image.repo }}:{{ .Values.image.tag }}"
+```
+
+And `values.yaml` supplies the defaults that fill those holes:
+
+```yaml
+# values.yaml
+replicaCount: 1
+image:
+  repo: example/web
+  tag: "1.0"
+```
+
+At install time Helm **renders** the templates against the values — substituting
+`{{ .Values.replicaCount }}` with `1` — and produces ordinary Kubernetes YAML,
+which it then sends to the API server. The cluster never sees a template; it sees
+plain manifests, exactly as if you'd written them by hand.
+
+The payoff is the one you were missing. The *structure* of the app lives **once**
+in `templates/`. Everything that varies between environments lives in values. To
+deploy to production you don't fork anything — you override values:
+
+```bash
+helm install web ./mychart -f values-prod.yaml
+```
+
+`values-prod.yaml` lists only the handful of things prod changes — `replicaCount: 5`,
+a prod hostname — and inherits the rest. A reviewer reads one small values diff
+instead of comparing five near-identical manifests. Drift has nowhere to hide,
+because there's only one definition.
+
+</Section>
+
+<Section
+  id="releases"
+  title="Releases: install, upgrade, and undo"
+  brief={{
+    problem: "Applying manifests gives you no memory — no record of what you deployed, no clean way to update it as a set, and no undo.",
+    mechanism: "Installing a chart creates a named release; every install and upgrade is recorded as a numbered revision stored in the cluster.",
+    cost: "Helm keeps release history in the cluster, which it must store and you must occasionally prune.",
+    takeaway: "Because each revision is a full snapshot, a bad upgrade is never a dead end — helm rollback re-applies the last good one.",
+  }}
+  quiz={{
+    question: "A `helm upgrade` ships a broken version to production. What's the fastest clean recovery?",
+    options: [
+      { text: "Manually kubectl edit each object back to its old values." },
+      { text: "helm rollback <release> to the previous revision, which re-applies that whole snapshot.", correct: true },
+      { text: "Delete the namespace and start over." },
+    ],
+  }}
+>
+
+Plain `kubectl apply` has no memory. It changes the cluster and forgets. Helm adds
+the memory. When you install a chart you create a named **release** — a living
+instance of that chart in your cluster:
+
+```bash
+helm install web ./mychart          # creates release "web", revision 1
+```
+
+Now change something — a new image tag, more replicas — and upgrade:
+
+```bash
+helm upgrade web ./mychart --set image.tag=2.0   # revision 2
+```
+
+Helm records **every** install and upgrade as a numbered **revision**, storing
+that history right in the cluster. That bookkeeping is what makes Helm safe rather
+than merely convenient. Each revision is a *complete snapshot* of the rendered
+manifests, so when revision 2 turns out to be broken, you don't reconstruct the old
+state by hand:
+
+```bash
+helm rollback web 1     # back to revision 1, in one command
+```
+
+The same memory powers the rest of the lifecycle. `helm list` shows every release
+and its current revision. `helm uninstall web` removes *every* object that release
+created — no orphaned Services or ConfigMaps left behind, because Helm knows exactly
+what it made.
+
+<Callout type="tip">
+Notice the shape underneath all of this: you declare the outcome you want — "release
+`web` should be this chart with these values" — and Helm reconciles the cluster to
+match, keeping a record so it can move you forward or back. It's the same
+declarative instinct the whole platform is built on, applied to whole applications.
+</Callout>
+
+This is why templating beats copy-paste decisively. Copies give you fifteen
+mutable files and no history. A chart gives you one parameterized definition, a
+named release per environment, and an undo button. Deployments become repeatable,
+reviewable, and reversible.
+
+</Section>
+
+<Section
+  id="ecosystem"
+  title="Charts you didn't write"
+  brief={{
+    problem: "Most infrastructure you need — a database, an ingress controller, a monitoring stack — is the same for everyone, and authoring it yourself is wasted, error-prone effort.",
+    mechanism: "Helm repositories publish vetted, versioned charts you install by reference; a chart can also declare dependencies on other charts, pulled in automatically.",
+    cost: "A third-party chart is someone else's defaults and someone else's code path — you must read its values and pin its version, not install blindly.",
+    takeaway: "Helm turns shared operational knowledge into installable packages, and lets your chart compose others as dependencies.",
+  }}
+  quiz={{
+    question: "What does a Helm repository let you do?",
+    options: [
+      { text: "Install a community-maintained, versioned chart by reference instead of authoring its manifests yourself.", correct: true },
+      { text: "Store container images instead of a registry." },
+      { text: "Run charts without an API server." },
+    ],
+  }}
+>
+
+The deepest payoff of treating an app as a package is that *other people's* packages
+become installable too. A **Helm repository** is a server that hosts charts by name
+and version, exactly as a registry hosts images. You add one and install from it:
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm install pg bitnami/postgresql -f my-values.yaml
+```
+
+That single command stands up a configured PostgreSQL — a chart maintained, tested,
+and versioned by people who run it for a living. You didn't write a StatefulSet, a
+Service, a Secret, or an init script; you supplied a small values file and inherited
+hundreds of lines of vetted YAML. Sites like **Artifact Hub** index thousands of such
+charts.
+
+Charts also **compose**. A chart can declare **dependencies** on other charts in its
+`Chart.yaml`, and Helm pulls them in as subcharts:
+
+```yaml
+# Chart.yaml
+dependencies:
+  - name: postgresql
+    version: "15.x.x"
+    repository: https://charts.bitnami.com/bitnami
+```
+
+Now your app's chart bundles its database chart. Installing your app installs the
+database too, with values you can override from your top-level `values.yaml`. The
+package boundary you drew around one app extends to its whole stack.
+
+<Callout type="warning">
+A third-party chart is convenience *and* trust. It's someone else's defaults running
+in your cluster, so read its `values.yaml`, understand what it deploys, and **pin a
+specific version** — never track "latest." An unpinned dependency is an unreviewed
+change waiting to land in production.
+</Callout>
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Helm's own documentation is unusually clear about *why* charts are shaped the way
+they are, not just how to write them.
+
+- **Helm Documentation — *Charts* and *Using Helm*.** The authoritative reference
+  for chart structure, templating, values, and the release lifecycle.
+  `helm.sh/docs/`
+- **Helm — *Chart Template Guide*.** A guided tour of the templating language,
+  built-in objects, and values overriding. `helm.sh/docs/chart_template_guide/`
+- **Artifact Hub.** Where the community publishes vetted charts (databases,
+  ingress controllers, monitoring stacks) you can install instead of authoring
+  from scratch. `artifacthub.io`
+
+Next chapter: a chart usually installs a Deployment, which assumes its pods are
+interchangeable. But databases, per-node agents, and batch jobs aren't — so we meet
+the other workload controllers and learn when a Deployment is the wrong tool.
+
+</Section>
+
+</ChapterReader>

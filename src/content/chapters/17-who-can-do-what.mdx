@@ -1,0 +1,304 @@
+---
+title: "Who Can Do What: RBAC & Security"
+chapterNumber: 17
+summary: "The API server is the single door to everything in the cluster — create a pod, read a Secret, delete a node. Something has to decide who may walk through it and do what. This chapter builds that answer from the ground up: verbs on resources, Roles and bindings, the identity a pod itself carries, and the kernel-level hardening that boxes a container in even after RBAC lets it run."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+
+<ChapterReader chapterId="17-who-can-do-what">
+
+<Section
+  id="the-door"
+  title="One door, many hands"
+  brief={{
+    problem: "Every action in the cluster goes through the API server, so without authorization any authenticated client could do anything — read every Secret, delete every node.",
+    mechanism: "RBAC sits at the API server and decides, per request, whether a given identity may perform a given action on a given resource.",
+    takeaway: "Authorization is the gate on the one door everything passes through; getting it right contains the damage when something is compromised.",
+  }}
+  quiz={{
+    question: "Why is authorization at the API server so central to cluster security?",
+    options: [
+      { text: "Because the API server stores container images." },
+      { text: "Because every action on the cluster flows through the API server, so the gate there controls everything.", correct: true },
+      { text: "Because it makes the network faster." },
+    ],
+  }}
+>
+
+You learned early that the API server is the cluster's single front door —
+*everyone*, human or controller, goes through it. That design is wonderful for
+observability and terrible if there's no gate, because it means a single door
+stands between any authenticated client and *everything*: every Secret, every
+Deployment, every node.
+
+So Kubernetes puts a guard at that door. After it has **authenticated** a request —
+worked out *who* is asking — it must **authorize** it: decide whether that identity
+may perform *this* action on *this* object. The dominant mechanism for that decision
+is **RBAC**, Role-Based Access Control, and the whole point of getting it right is
+**containment**. When a workload is compromised — and eventually one will be — RBAC
+is what decides whether the attacker can read one namespace's ConfigMaps or walk off
+with every Secret in the cluster.
+
+The mental model is a sentence the API server completes for every request: *Can this
+**subject** perform this **verb** on this **resource**?* The rest of the chapter is
+the vocabulary for filling in those three blanks, and the discipline — **least
+privilege** — for filling them in as narrowly as possible.
+
+</Section>
+
+<Section
+  id="verbs-resources"
+  title="Verbs, resources, and Roles"
+  brief={{
+    problem: "You need a precise way to express 'allowed to read pods in this namespace' without granting anything more.",
+    mechanism: "A Role is a list of rules, each pairing verbs (get, list, create, delete) with resources (pods, secrets); a RoleBinding grants a Role to subjects.",
+    cost: "RBAC is additive-only — there are no deny rules — so least privilege means granting little, not subtracting from broad grants.",
+    takeaway: "Permissions are built up from small, explicit verb-on-resource grants tied to subjects by bindings.",
+  }}
+  quiz={{
+    question: "How do you grant a permission to a subject in RBAC?",
+    options: [
+      { text: "Write a Role listing allowed verbs on resources, then a RoleBinding tying that Role to the subject.", correct: true },
+      { text: "Add a 'deny everything else' rule to every Role." },
+      { text: "Edit the API server's source code." },
+    ],
+  }}
+>
+
+RBAC's vocabulary is small and precise. A permission is a pairing of:
+
+- **Verbs** — the actions: `get`, `list`, `watch`, `create`, `update`, `patch`,
+  `delete`.
+- **Resources** — the object kinds: `pods`, `secrets`, `deployments`, `services`,
+  `nodes`.
+
+A **Role** bundles these into a list of rules. Here's one that can do exactly two
+things — read pods — and nothing else:
+
+```yaml
+kind: Role
+metadata: { namespace: team-a, name: pod-reader }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+```
+
+A Role by itself grants nobody anything; it's just a named capability sitting on a
+shelf. A **RoleBinding** takes it off the shelf and hands it to **subjects** — users,
+groups, or (as we'll see) ServiceAccounts:
+
+```yaml
+kind: RoleBinding
+metadata: { namespace: team-a, name: read-pods }
+subjects:
+  - kind: User
+    name: alice
+roleRef:
+  kind: Role
+  name: pod-reader
+```
+
+One property shapes everything about how you use RBAC: **it is purely additive.**
+There are no "deny" rules. A subject can do exactly what some binding grants it, and
+nothing else is permitted by default. So least privilege isn't about carving
+exceptions out of a broad grant — it's about granting *little* in the first place.
+You start from "can do nothing" and add only the specific verbs on the specific
+resources a subject genuinely needs.
+
+</Section>
+
+<Section
+  id="scope"
+  title="Namespace or cluster: Role vs ClusterRole"
+  brief={{
+    problem: "Some permissions belong to one namespace ('read pods in team-a'); others are inherently cluster-wide ('manage nodes' or 'read pods everywhere').",
+    mechanism: "Role + RoleBinding are namespaced; ClusterRole + ClusterRoleBinding apply across all namespaces and to cluster-scoped resources.",
+    takeaway: "Match the scope of the grant to the scope of the need — don't reach for cluster-wide when one namespace will do.",
+  }}
+  quiz={{
+    question: "What's the difference between a Role and a ClusterRole?",
+    options: [
+      { text: "A Role is for humans; a ClusterRole is for pods." },
+      { text: "A Role is scoped to one namespace; a ClusterRole grants permissions cluster-wide and over cluster-scoped resources.", correct: true },
+      { text: "There is no difference; they are aliases." },
+    ],
+  }}
+>
+
+Permissions come in two scopes, and RBAC gives you a matched pair for each.
+
+A **Role** and its **RoleBinding** are **namespaced**. They grant permissions inside
+a single namespace and nowhere else. "Read pods in `team-a`" is a Role in `team-a`;
+it says nothing about pods in `team-b`. This is the right tool most of the time,
+because most workloads and teams live within one namespace.
+
+A **ClusterRole** and its **ClusterRoleBinding** apply **cluster-wide**. You need
+them in two situations:
+
+1. **Cluster-scoped resources.** Some objects don't live in a namespace at all —
+   `nodes`, `namespaces`, `persistentvolumes`. Permissions over them *must* be a
+   ClusterRole.
+2. **The same permission across every namespace.** "Read pods in *all* namespaces"
+   for a monitoring tool is a ClusterRole bound cluster-wide.
+
+There's a useful hybrid worth knowing: you can reference a **ClusterRole** from a
+namespaced **RoleBinding**. That lets you define a common capability once — say a
+generic "view" ClusterRole — and grant it inside one namespace only. The ClusterRole
+supplies the *what*; the namespaced RoleBinding supplies the *where*.
+
+<Callout type="tip">
+Default to the narrow tool. If a namespaced Role does the job, use it. Reaching for a
+ClusterRoleBinding "to be safe" is exactly backwards — it's the broadest grant in the
+system, and every one you create is a bigger thing to get wrong.
+</Callout>
+
+</Section>
+
+<Section
+  id="serviceaccounts"
+  title="ServiceAccounts: identity for pods"
+  brief={{
+    problem: "Pods often need to call the API server too, but they aren't human users with certificates — they need their own identity.",
+    mechanism: "A pod runs as a ServiceAccount whose token is mounted into the container; bind that ServiceAccount to a least-privilege Role to control what the pod can do.",
+    cost: "Every pod gets a default ServiceAccount, so forgetting to scope it can quietly over-permission a workload.",
+    takeaway: "Give each app its own ServiceAccount bound to only what it needs; never run workloads as cluster-admin.",
+  }}
+  quiz={{
+    question: "What identity does a pod use when it calls the Kubernetes API?",
+    options: [
+      { text: "The node's root user." },
+      { text: "A ServiceAccount, whose token is mounted into the pod.", correct: true },
+      { text: "The cluster administrator's certificate." },
+    ],
+  }}
+>
+
+RBAC's subjects so far have been *users*, which are humans authenticating with
+certificates or an identity provider. But pods need to talk to the API server too — a
+controller reconciling objects, an app reading its own ConfigMaps, an operator
+managing resources. A pod isn't a human and has no certificate. Its identity is a
+**ServiceAccount**.
+
+A ServiceAccount is a namespaced identity meant for in-cluster workloads. When a pod
+runs as one, Kubernetes mounts a token for that ServiceAccount into the container,
+and the pod presents it on every API call. The API server authenticates the pod as
+that ServiceAccount — and then RBAC takes over, checking what that ServiceAccount is
+allowed to do.
+
+That's where least privilege becomes concrete. The recipe is always the same:
+
+```yaml
+kind: RoleBinding
+metadata: { name: log-reader-binding, namespace: team-a }
+subjects:
+  - kind: ServiceAccount
+    name: log-reader
+roleRef:
+  kind: Role
+  name: pod-reader   # only get/list/watch pods
+```
+
+Create a **dedicated** ServiceAccount per app, bind it to a Role granting *only* what
+that app needs, and run the pod as it. Now if the app is compromised, the attacker
+inherits only those narrow permissions.
+
+<Callout type="warning">
+Every pod that doesn't specify a ServiceAccount gets the namespace's `default` one —
+and people are tempted to bind broad powers to `default` "to make things work." Don't.
+And never bind a workload to the built-in `cluster-admin` ClusterRole: a single
+breached pod with cluster-admin is a breached *cluster*.
+</Callout>
+
+</Section>
+
+<Section
+  id="pod-security"
+  title="Pod security: hardening the container itself"
+  brief={{
+    problem: "RBAC controls what a pod can do through the API, but a compromised process can still try to abuse the node it runs on — root access, privilege escalation, dangerous capabilities.",
+    mechanism: "A securityContext constrains the container at the kernel level; Pod Security Standards bundle these into baseline and restricted profiles enforced per namespace.",
+    takeaway: "Defense in depth: RBAC guards the API, securityContext guards the kernel — use both.",
+  }}
+  quiz={{
+    question: "What does setting runAsNonRoot and dropping all capabilities in a pod's securityContext achieve?",
+    options: [
+      { text: "It speeds up the container's startup." },
+      { text: "It hardens the container at the kernel level, shrinking what a compromised process can do to the node.", correct: true },
+      { text: "It grants the pod more API permissions." },
+    ],
+  }}
+>
+
+RBAC answers "what can this pod do to the *cluster*?" There's a second, lower
+question it doesn't touch: "what can this pod do to the *node* it's running on?" A
+container is, underneath, just a Linux process. If it runs as root, can escalate
+privileges, or holds powerful kernel capabilities, a compromise inside it can become
+a compromise of the host.
+
+The fix lives on the pod itself: the **securityContext**. It constrains the container
+at the kernel level:
+
+```yaml
+securityContext:
+  runAsNonRoot: true            # refuse to run as root
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]               # surrender all Linux capabilities
+  readOnlyRootFilesystem: true
+```
+
+Each line shrinks the blast radius. Not root, so it can't touch root-owned files on
+the host. No privilege escalation, so it can't `setuid` its way up. No capabilities,
+so it can't do the privileged kernel operations that container escapes rely on.
+
+Setting this per pod by hand is easy to forget, so Kubernetes packages sensible
+bundles as **Pod Security Standards**: `privileged` (unrestricted), `baseline` (blocks
+the known-dangerous things), and **`restricted`** (the strict profile — non-root, no
+privilege escalation, a tight capability set, and more). You apply a standard to a
+*namespace* with a label, and the cluster enforces it on every pod admitted there:
+
+```yaml
+# on the namespace
+labels:
+  pod-security.kubernetes.io/enforce: restricted
+```
+
+Now a pod that asks to run as root in that namespace is simply rejected.
+
+This is **defense in depth**, and it's the right note to end on. RBAC contains a
+workload at the API; securityContext and Pod Security Standards contain it at the
+kernel. Neither alone is enough — a pod with no API permissions can still attack its
+node, and a hardened container with cluster-admin can still loot the cluster. Least
+privilege at *both* layers is how you make a single compromise stay small.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Authorization and pod security are documented as distinct concerns; read both, since
+real security needs the two layers together.
+
+- **Kubernetes Documentation — *Using RBAC Authorization*.** The authoritative
+  reference for Roles, ClusterRoles, bindings, and subjects.
+  `kubernetes.io/docs/reference/access-authn-authz/rbac/`
+- **Kubernetes Documentation — *Service Accounts*.** How pod identity works and how
+  tokens are mounted and used. `kubernetes.io/docs/concepts/security/service-accounts/`
+- **Kubernetes Documentation — *Pod Security Standards* and *Security Context*.** The
+  baseline/restricted profiles and the kernel-level controls behind them.
+  `kubernetes.io/docs/concepts/security/pod-security-standards/`
+
+Next chapter: you've now seen the same control-loop idea reused for workloads,
+networking, storage, and access. In the finale we make that idea *yours* — teaching
+Kubernetes brand-new nouns with CustomResourceDefinitions and the Operator pattern.
+
+</Section>
+
+</ChapterReader>

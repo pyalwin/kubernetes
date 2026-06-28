@@ -1,0 +1,345 @@
+---
+title: "The Kernel Tricks Behind a Container"
+chapterNumber: 3
+summary: "Chapter 2 said a container is a process wearing three disguises. This chapter names them precisely: namespaces decide what a process can SEE, cgroups decide what it can USE, and a union filesystem stacks its image layers. These three kernel features are exactly what a Pod's securityContext and resource limits ultimately compile down to."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import { kernelMechanismNodes } from '@/data/foundations';
+
+<ChapterReader chapterId="03-kernel-tricks">
+
+<Section
+  id="two-questions"
+  title="Two different questions"
+  brief={{
+    problem: "'Isolation' sounds like one thing, so people expect one mechanism — and then can't explain why a container can be blind to other processes yet still hog the whole CPU.",
+    mechanism: "Isolation is really two independent questions: what can this process SEE, and how much can it USE? The kernel answers them with two separate features.",
+    takeaway: "Namespaces govern visibility; cgroups govern consumption. They are orthogonal — you can have one without the other.",
+  }}
+  quiz={{
+    question: "A container can't see any other process on the host, yet it pins all 16 CPU cores at 100%. Which mechanism failed to constrain it?",
+    options: [
+      { text: "Namespaces — it shouldn't be able to see the cores." },
+      { text: "cgroups — visibility was isolated, but consumption was never capped.", correct: true },
+      { text: "The union filesystem — layers leaked." },
+    ],
+  }}
+>
+
+When we say a container is "isolated," we are quietly bundling two completely
+different ideas, and prying them apart is the key that unlocks this whole chapter.
+
+Ask yourself what isolation actually requires. First: the container shouldn't be
+able to *see* the host's other processes, snoop on its network, or read its
+files. That's a question about **visibility** — what exists in this process's
+world. Second: the container shouldn't be able to *starve* its neighbors by
+eating all the CPU or all the memory. That's a question about **consumption** —
+how much of the machine it may use.
+
+These are independent. A process could be perfectly blind to everything around it
+and *still* consume every CPU cycle on the box — total visual isolation, zero
+consumption limits. Or it could be capped to 5% CPU while still able to see and
+signal every other process on the host — totally constrained consumption, zero
+visual isolation. Neither alone is "a container." You need both, and because they
+answer different questions, the kernel provides them as two different features:
+
+- **Namespaces** answer *what can I see?* They give a process a private view of
+  some slice of the system.
+- **cgroups** (control groups) answer *how much can I use?* They meter and cap a
+  process's resource consumption.
+
+Hold this split in your head for the rest of the chapter; we'll take each one
+apart in turn. The reason it pays off is that Kubernetes exposes both, separately,
+in every Pod you ever write — and once you see that a `securityContext` is really
+configuring namespaces and a `resources` block is really configuring cgroups, the
+Pod spec stops being arbitrary YAML and becomes a thin remote control over these
+two kernel levers.
+
+<Figure number="3.1" caption="The two orthogonal levers, plus the filesystem trick. Namespaces gate what a process sees; cgroups gate what it uses; OverlayFS assembles its root. Click each.">
+  <Diagram client:visible id="ch3-mechanisms" title="Namespaces vs. cgroups vs. OverlayFS" nodes={kernelMechanismNodes} />
+</Figure>
+
+</Section>
+
+<Section
+  id="namespaces"
+  title="Namespaces: controlling what a process sees"
+  brief={{
+    problem: "For a process to believe it owns the machine, it must see its own process list, its own network, its own filesystem root — not the host's.",
+    mechanism: "The kernel offers several namespace types (PID, network, mount, UTS, IPC, user); each wraps one global resource in a private, per-container view.",
+    takeaway: "A container's 'private world' is just a bundle of namespaces. Inside, it sees PID 1 and its own interfaces; outside, it's an ordinary host process.",
+  }}
+  quiz={{
+    question: "Inside a container, the main process is PID 1. On the host it's PID 4821. How?",
+    options: [
+      { text: "The kernel renumbers every process on the whole machine." },
+      { text: "A PID namespace gives the container its own process-number space, so the same process is 1 inside and 4821 outside.", correct: true },
+      { text: "There are two copies of the process running at once." },
+    ],
+  }}
+>
+
+A **namespace** wraps one global system resource so that the processes inside the
+namespace see their own isolated instance of it, while the host and other
+namespaces are invisible. The kernel ships several types, and a container is
+simply a process placed into a fresh bundle of them at once. The important ones:
+
+- **PID namespace** — its own process-number space. The container's main process
+  is PID 1 *inside*, even though the host kernel knows it as PID 4821. It cannot
+  see, signal, or even prove the existence of host processes; its `ps` lists only
+  its own.
+- **Network namespace** — its own network stack: its own interfaces, its own IP
+  address, its own routing table and ports. This is why two containers can each
+  bind port 80 with no clash — they're port 80 on two *different* private stacks.
+  (This is the foundation for everything in the next chapter.)
+- **Mount namespace** — its own filesystem tree. The container's `/` is the
+  layered image root from Chapter 2, not the host's `/`. It cannot wander into the
+  host's files because, from inside, they aren't mounted.
+- **UTS namespace** — its own hostname and domain name, so a container can call
+  itself `web-1` without renaming the host.
+- **IPC namespace** — its own inter-process-communication objects (shared memory,
+  semaphores), so containers can't reach each other's IPC.
+- **User namespace** — its own mapping of user and group IDs. This lets a process
+  be `root` (UID 0) *inside* the container while mapping to an unprivileged,
+  harmless UID *outside* — a major hardening win.
+
+None of this is copying or emulation. There is one kernel, one real process
+table, one real network stack. A namespace is a *filtered lens*: the kernel
+tags the process and, whenever it asks "what processes exist?" or "what's my
+IP?", answers using only what's tagged to its namespace. The same process, asked
+the same question from inside versus outside, gets two honest but different
+answers.
+
+<Callout type="note">
+Here's the Kubernetes payoff. A **Pod** is defined as one or more containers that
+*share a subset of namespaces* — specifically the network and IPC namespaces.
+That's the entire technical reason containers in a Pod reach each other on
+`localhost` and share an IP: they're living in the *same* network namespace. The
+Pod isn't a metaphor; it's a namespace-sharing boundary.
+</Callout>
+
+</Section>
+
+<Section
+  id="cgroups"
+  title="cgroups: controlling what a process uses"
+  brief={{
+    problem: "Visibility isolation does nothing to stop one container from eating all the CPU or all the RAM and taking its neighbors down with it.",
+    mechanism: "Control groups (cgroups) organize processes into a tree and meter and cap each group's CPU time, memory, and I/O bandwidth.",
+    cost: "Limits aren't free magic — hit a memory cap and the kernel's OOM killer terminates the process; hit a CPU cap and it gets throttled.",
+    takeaway: "cgroups are the enforcement behind resource requests and limits: how the scheduler trusts that a Pod will stay in its lane.",
+  }}
+  quiz={{
+    question: "A Pod sets a memory limit of 256Mi and its process tries to allocate 300Mi. What happens?",
+    options: [
+      { text: "The allocation silently succeeds; limits are advisory." },
+      { text: "The cgroup's memory cap is exceeded and the kernel's OOM killer terminates the process.", correct: true },
+      { text: "The host reboots to free memory." },
+    ],
+  }}
+>
+
+Namespaces hide the neighbors; they do nothing to stop you from eating their
+lunch. That job belongs to **control groups**, universally shortened to
+**cgroups** — the kernel feature that meters and limits what a set of processes
+may consume.
+
+A cgroup is a labelled group of processes with resource controllers attached.
+The kernel arranges them in a tree and, for each group, can both *account* ("how
+much CPU has this group used?") and *enforce* ("this group may not exceed X").
+The controllers that matter most:
+
+- **CPU.** You can grant a group a *share* (relative weight under contention) and
+  a hard *quota* (e.g. "at most 1.5 cores' worth of time per scheduling period").
+  Exceed the quota and the kernel **throttles** the group — it's paused until the
+  next period. Your process isn't killed; it's just made to wait, which shows up
+  as mysterious latency if you're not expecting it.
+- **Memory.** You set a ceiling in bytes. Allocate under it and all is well. Try
+  to cross it and there's no negotiating: the kernel's **OOM (out-of-memory)
+  killer** terminates a process in the group to bring usage back under the cap.
+  This is the true story behind a container that keeps dying with status
+  `OOMKilled`.
+- **I/O.** You can cap block-device read/write bandwidth so one container can't
+  saturate the disk and starve the rest.
+
+The asymmetry between CPU and memory is worth internalizing because it explains a
+lot of production behavior: **CPU is compressible, memory is not.** Over your CPU
+budget? You wait — throttled, slow, but alive. Over your memory budget? You die —
+there's no "wait" for memory the kernel has already promised elsewhere.
+
+This is the machinery directly under Kubernetes' `resources` block:
+
+```yaml
+resources:
+  requests:   # what the scheduler reserves for you when placing the Pod
+    cpu: "250m"
+    memory: "256Mi"
+  limits:     # the cgroup caps actually enforced at runtime
+    cpu: "1"
+    memory: "512Mi"
+```
+
+`requests` are how the scheduler *bin-packs* — it promises each Pod that much
+headroom and won't overcommit a node past what it can honor. `limits` become the
+literal cgroup caps. When you read in Chapter 1 that a controller "just makes
+another copy," cgroups are part of why that's safe: a misbehaving copy is boxed
+in, throttled or OOM-killed, instead of dragging the whole node down with it.
+
+</Section>
+
+<Section
+  id="union-fs"
+  title="Union filesystems: stacking the layers"
+  brief={{
+    problem: "Chapter 2 promised that image layers are stacked and a writable layer added on top — but it never said how, without copying gigabytes per container.",
+    mechanism: "A union (overlay) filesystem merges several read-only layers and one writable layer into a single tree, using copy-on-write so writes don't touch the shared layers.",
+    takeaway: "OverlayFS is the kernel trick that makes layered images cheap: many containers share read-only layers and each gets a private, copy-on-write top.",
+  }}
+  quiz={{
+    question: "A container modifies a file that lives in a shared read-only image layer. What actually happens on disk?",
+    options: [
+      { text: "The shared layer is edited in place, affecting every other container." },
+      { text: "Copy-on-write copies the file up into this container's private writable layer and edits the copy; the shared layer is untouched.", correct: true },
+      { text: "The write is rejected because the layer is read-only." },
+    ],
+  }}
+>
+
+The third trick is the one that makes Chapter 2's layered images practical rather
+than merely elegant. We said an image is a stack of read-only layers and a
+running container adds a writable layer on top. The kernel feature that performs
+that stacking — without copying the layers for every container — is a **union
+filesystem**, most commonly **OverlayFS** on Linux.
+
+A union filesystem takes several directories and presents them as one merged
+tree. In overlay terms there are *lower* directories (the read-only image layers,
+bottom to top) and an *upper* directory (the container's private writable layer).
+When the container looks up a file, the kernel searches from the upper layer
+downward and returns the first match — so an upper-layer file *shadows* a
+same-named file below it. The container sees one ordinary, complete filesystem; it
+has no idea it's a collage.
+
+The clever part is what happens on a **write**, governed by **copy-on-write
+(CoW)**:
+
+- **Read a file** that exists only in a lower (read-only) layer: served straight
+  from that shared layer. No copying.
+- **Modify a file** that lives in a lower layer: the kernel first *copies it up*
+  into the writable upper layer, then applies your change there. The original in
+  the shared layer is never touched. Every other container reading that file still
+  sees the pristine version.
+- **Delete a file** from a lower layer: it can't actually be removed from a
+  read-only layer, so the kernel writes a tiny "whiteout" marker in the upper
+  layer that hides it from view.
+
+Two things this buys you, both already promised in Chapter 2 and now paid for.
+First, **sharing**: a hundred containers off the same image share its
+read-only layers on disk exactly once; only their small upper layers differ.
+Second, **disposability**: stopping a container and discarding its upper layer is
+instant and harmless — the shared template underneath is pristine, ready for the
+next instance. That's the mechanism that makes "cattle, not pets" cheap.
+
+<Callout type="tip">
+This is also why writing lots of data inside a container's own filesystem is a
+trap: it piles up in the ephemeral upper layer and vanishes when the container
+does. Persistent data belongs on a **volume** mounted in — a separate filesystem
+that lives outside the layered stack and survives the container. The union
+filesystem is for the *image*, not for your database.
+</Callout>
+
+</Section>
+
+<Section
+  id="it-compiles-down"
+  title="It all compiles down to this"
+  brief={{
+    problem: "A Pod spec looks like a pile of unrelated YAML knobs; without a mental model, each field is something to memorize rather than understand.",
+    mechanism: "Most of the spec is a high-level remote control: securityContext drives namespaces, resources drives cgroups, the image drives the union filesystem.",
+    takeaway: "Kubernetes doesn't invent isolation — it orchestrates the kernel's existing three tricks. The Pod spec is the dialect you use to ask for them.",
+  }}
+  quiz={{
+    question: "Which kernel mechanisms does a typical Pod spec ultimately configure?",
+    options: [
+      { text: "A custom Kubernetes isolation engine unrelated to the Linux kernel." },
+      { text: "Namespaces (via securityContext), cgroups (via resources), and a union filesystem (via the image and volumes).", correct: true },
+      { text: "Only the network, nothing else." },
+    ],
+  }}
+>
+
+Step back and the payoff snaps into focus. Kubernetes did not invent a new way to
+isolate workloads. It *orchestrates the three kernel tricks you just met*, and the
+Pod spec is mostly a friendly dialect for asking the kernel to apply them. Read a
+spec with that lens and it stops being a grab-bag of fields:
+
+```yaml
+spec:
+  containers:
+    - name: web
+      image: web:1.4          # → union filesystem: which layers to stack
+      resources:
+        limits:
+          cpu: "1"            # → cgroup CPU quota
+          memory: "512Mi"     # → cgroup memory cap (cross it → OOMKilled)
+      securityContext:
+        runAsUser: 1000       # → user namespace mapping (not root)
+        readOnlyRootFilesystem: true   # → mount namespace + overlay, read-only
+  securityContext:
+    fsGroup: 2000
+```
+
+Trace each line to its mechanism. The `image` selects the read-only layers the
+**union filesystem** will stack. `resources.limits` become **cgroup** caps —
+overshoot CPU and you're throttled, overshoot memory and the OOM killer ends you.
+`securityContext.runAsUser` maps into a **user namespace**;
+`readOnlyRootFilesystem` leans on the **mount namespace** and overlay to refuse
+writes to the root. And the Pod boundary itself — why these containers share an IP
+and reach each other on `localhost` — is a shared **network namespace**.
+
+That's the whole shape of it. Everything above this layer in the book — the
+scheduler deciding *where* a Pod lands, the controllers ensuring *how many* exist,
+the networking wiring them together — eventually bottoms out in a node asking its
+kernel to create a process with these three tricks applied. Kubernetes is the
+distributed brain; namespaces, cgroups, and union filesystems are the hands.
+
+Knowing this also makes you faster at the keyboard. `OOMKilled`? A cgroup memory
+cap. A container that can't see a host process? A PID namespace doing its job.
+Two containers fighting over port 80? They wanted separate network namespaces and
+got the same one. The error messages stop being riddles once you know which trick
+each one is about.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The "namespaces + cgroups + union filesystem" decomposition in this chapter
+comes straight from the Linux kernel's own documentation and manual pages.
+
+- **Linux man pages — `namespaces(7)`, `cgroups(7)`, `user_namespaces(7)`.** The
+  authoritative descriptions of each isolation primitive and its semantics.
+  `man7.org/linux/man-pages/`
+- **Linux kernel documentation — *Control Group v2*.** The current cgroup
+  hierarchy, controllers, and limit semantics behind resource requests/limits.
+  `docs.kernel.org/admin-guide/cgroup-v2.html`
+- **Linux kernel documentation — *OverlayFS*.** How lower/upper layers and
+  copy-on-write produce a container's merged root filesystem.
+  `docs.kernel.org/filesystems/overlayfs.html`
+- **Kubernetes Documentation — *Pod Security* and *Managing Resources for
+  Containers*.** How `securityContext` and `resources` map onto these primitives.
+  `kubernetes.io/docs/`
+
+Next chapter: each container got its own network namespace and its own IP. That
+solves isolation and immediately creates a new problem — those IPs are ephemeral
+and constantly changing, so how does one container reliably *find* another?
+
+</Section>
+
+</ChapterReader>

@@ -1,0 +1,217 @@
+---
+title: "Knowing What's Happening"
+chapterNumber: 20
+summary: "A healthy system is invisible; a broken one at 3am needs answers fast. This chapter builds observability from the three pillars — logs, metrics, traces — then shows how Prometheus pulls metrics, how a little PromQL turns them into alerts, and how a node-agent ships every container's logs without the app lifting a finger."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { observabilityTerminal } from '@/data/production';
+
+<ChapterReader chapterId="20-knowing-whats-happening">
+
+<Section
+  id="the-3am-question"
+  title="The 3am question"
+  brief={{
+    problem: "When the pager fires, you don't need more code — you need to ask new questions of a system already running, and get answers in seconds.",
+    mechanism: "Observability is the property that lets you do that. It is built from three kinds of signal, each answering a different question.",
+    takeaway: "Observability is not a dashboard; it is the ability to interrogate a running system you can't redeploy.",
+  }}
+  quiz={{
+    question: "What problem is 'observability' meant to solve?",
+    options: [
+      { text: "Making the application start faster." },
+      { text: "Letting you ask new diagnostic questions of a live system without shipping new code.", correct: true },
+      { text: "Reducing the number of Pods you run." },
+    ],
+  }}
+>
+
+When everything works, you barely think about your cluster. The danger is the
+other moment: it is 3am, the pager is screaming, error rates are climbing, and
+the only question that matters is *what changed?* You cannot ship a debug build
+and wait for a deploy. You have to ask questions of the system **as it is running
+right now** — and get answers fast.
+
+That ability has a name: **observability**. It is not a product you buy or a
+single graph you stare at. It is a property of a system — the degree to which its
+external outputs let you infer what is happening inside without stopping it or
+modifying it. A system is observable when a question you didn't anticipate at
+build time can still be answered at incident time.
+
+You get there by emitting the right signals all along, while things are calm, so
+they are waiting for you when things are not. Convention groups those signals into
+**three pillars**, and the rest of this chapter is essentially those three plus
+the machinery that moves them around.
+
+</Section>
+
+<Section
+  id="three-pillars"
+  title="The three pillars"
+  brief={{
+    problem: "No single signal answers every question — 'how often?' is different from 'what exactly happened?' which is different from 'where did the time go?'",
+    mechanism: "Logs are discrete events, metrics are numeric time series, and traces follow one request across services. Each covers what the others miss.",
+    takeaway: "Logs say what happened, metrics say how much and how often, traces say where.",
+  }}
+  quiz={{
+    question: "Which signal best answers 'which downstream service is eating my request latency?'",
+    options: [
+      { text: "Logs — by grepping every service's output." },
+      { text: "A distributed trace, which follows one request hop by hop and times each span.", correct: true },
+      { text: "A single CPU metric." },
+    ],
+  }}
+>
+
+The three pillars are **logs**, **metrics**, and **traces**, and the reason there
+are three is that each answers a question the others handle badly.
+
+- **Logs** are timestamped, discrete events — `GET /api/orders 200 27ms`,
+  `FATAL config missing`. They are the richest in detail: when you need to know
+  *exactly* what happened to one request, a log line often has it verbatim. The
+  cost is volume — searching billions of lines is slow and expensive.
+- **Metrics** are numeric measurements sampled over time — CPU percent, requests
+  per second, error ratio. They are cheap to store and aggregate, which makes
+  them ideal for dashboards, trends, and the thresholds that trigger alerts. What
+  they *don't* give you is the story of any single request.
+- **Traces** follow one request as it travels across services, recording a timed
+  **span** for each hop. When a metric tells you "p99 latency doubled" and a log
+  tells you "this request was slow," a trace tells you *which service in the
+  chain* spent the time.
+
+<Callout type="note">
+Think of it as zoom levels. Metrics are the wide shot — something is wrong, and
+roughly where. Traces narrow to the request path and the slow hop. Logs are the
+close-up — the exact error on the exact line. You move between them during an
+incident, and a good setup makes that movement fast.
+</Callout>
+
+</Section>
+
+<Section
+  id="prometheus"
+  title="Metrics, the Prometheus way"
+  brief={{
+    problem: "Something has to collect metrics from a constantly changing set of Pods and store them queryably — without each app knowing where the monitoring system lives.",
+    mechanism: "Prometheus is pull-based: every workload exposes a /metrics HTTP endpoint, and Prometheus scrapes those endpoints on an interval, discovering targets from the Kubernetes API.",
+    takeaway: "Pull means Prometheus always knows if a target is up — a failed scrape is itself a signal.",
+  }}
+  quiz={{
+    question: "How does Prometheus get metrics out of your Pods?",
+    options: [
+      { text: "Each Pod pushes metrics to Prometheus over gRPC." },
+      { text: "Prometheus periodically scrapes a /metrics HTTP endpoint that each target exposes.", correct: true },
+      { text: "It reads them straight out of etcd." },
+    ],
+  }}
+>
+
+The de-facto standard for metrics in Kubernetes is **Prometheus**, and its
+defining choice is that it **pulls**. Each workload exposes a plain HTTP endpoint
+— conventionally `/metrics` — that prints its current numbers in a simple text
+format. Prometheus discovers targets from the Kubernetes API and **scrapes** each
+endpoint on a fixed interval, storing every sample as a time series.
+
+Pull sounds like a detail; it changes the failure model. Because Prometheus
+initiates each scrape, a target that goes silent produces a *failed scrape*,
+which is itself an observable event — you learn a Pod is unreachable for free.
+Apps never need to know the monitoring system's address, and adding a new replica
+needs no configuration: it appears via service discovery and gets scraped
+automatically.
+
+You ask questions of the stored series with **PromQL**:
+
+```text
+# requests per second over 5 minutes, by route
+sum(rate(http_requests_total[5m])) by (route)
+
+# error ratio: 5xx responses over all responses
+sum(rate(http_requests_total{code=~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+```
+
+`rate(...[5m])` turns an ever-climbing counter into a per-second rate; `sum by`
+collapses the labels you don't care about. **Alerting** is the same language with
+a clock attached: a rule fires when an expression stays true for a duration — say
+error ratio `> 5%` for ten minutes — and Alertmanager routes the resulting page
+to the right people. Dashboards and alerts are just saved PromQL.
+
+</Section>
+
+<Section
+  id="k8s-signals"
+  title="How Kubernetes hands you the signals"
+  brief={{
+    problem: "Pods are ephemeral and write to stdout; you need their CPU/memory and their logs gathered without coupling collection to any one Pod's lifetime.",
+    mechanism: "metrics-server serves basic CPU/memory through the metrics API, and a per-node log agent tails every container's stdout and ships it to a central store.",
+    takeaway: "Collection scales with nodes, not Pods — one agent per machine handles every container on it.",
+  }}
+  quiz={{
+    question: "Why run the log collector as one agent per node rather than one per Pod?",
+    options: [
+      { text: "Pods aren't allowed to write logs." },
+      { text: "A node agent tails the stdout of every container on its node, so collection scales with machines and survives Pods coming and going.", correct: true },
+      { text: "Per-node agents are required by etcd." },
+    ],
+  }}
+>
+
+Kubernetes meets this model halfway, supplying just enough plumbing that the
+tools above have something to read.
+
+For **metrics**, the lightweight **metrics-server** (the same one the HPA depends
+on) collects per-Pod CPU and memory and serves it through the metrics API. That
+is the floor; your application metrics still come from your own `/metrics`
+endpoint, scraped by Prometheus.
+
+For **logs**, Kubernetes leans on a simple convention: containers write to
+**stdout/stderr**, and the kubelet captures that stream to files on the node.
+Collection then uses a **node-agent** pattern — one log shipper (Fluent Bit,
+Vector, and friends) runs on every node, usually as a DaemonSet, tailing the
+container log files for *all* Pods on that node and forwarding them to a central
+store. The win is that collection scales with the number of **nodes**, not Pods,
+and keeps working as Pods are created and destroyed underneath it.
+
+Two commands let you read these signals directly. `kubectl top` queries
+metrics-server for live resource use; `kubectl logs` streams a container's
+stdout. Try both — `kubectl top pods`, then `kubectl logs` on one of them:
+
+<Figure number="20.1" caption="Reading the two raw signals by hand: live resource use from metrics-server, and a container's own stdout.">
+  <KubectlTerminal client:visible id="ch20-term" commands={observabilityTerminal} />
+</Figure>
+
+Those two commands are the manual version of what Prometheus and the log agent do
+continuously, for everything, all the time — so that at 3am the answer is already
+recorded and waiting.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Observability is a deep field; these are the load-bearing references behind this
+chapter.
+
+- **Kubernetes Documentation — *Logging Architecture* and *Resource Metrics
+  Pipeline*.** How container stdout becomes node logs, and how metrics-server
+  serves CPU/memory. `kubernetes.io/docs/concepts/cluster-administration/logging/`
+- **Prometheus Documentation — *Overview* and *Querying (PromQL)*.** The
+  pull model, the data model, and the query language used for dashboards and
+  alerts. `prometheus.io/docs/`
+- **Sridharan, *Distributed Systems Observability* (O'Reilly, 2018).** The
+  three-pillars framing and why each signal answers a different question.
+
+Next chapter: now that you can *see* what's happening, *Shipping Safely* uses
+those signals to change what's running without taking it down — rolling updates,
+canaries, and GitOps reconciling the cluster back to a Git repo.
+
+</Section>
+
+</ChapterReader>

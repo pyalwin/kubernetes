@@ -1,0 +1,251 @@
+---
+title: "Teaching Kubernetes New Nouns"
+chapterNumber: 18
+summary: "Kubernetes ships with a fixed vocabulary — Pod, Service, Deployment. But its real power is that the vocabulary is open: you can add your own nouns and your own controllers that act on them. This finale shows how CustomResourceDefinitions extend the API, and how the Operator pattern marries a new noun to the very same reconcile loop from Chapter 1 — turning operational expertise into software."
+readingTime: "22 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+
+<ChapterReader chapterId="18-teaching-new-nouns">
+
+<Section
+  id="fixed-vocabulary"
+  title="A vocabulary you can extend"
+  brief={{
+    problem: "The built-in kinds (Pod, Service, Deployment) describe generic infrastructure, not your specific domain — 'a Postgres cluster with backups' has no built-in noun.",
+    mechanism: "Kubernetes lets you register entirely new resource kinds, so the API can speak your domain's language as first-class objects.",
+    takeaway: "The set of things Kubernetes understands is open, not closed — you can add to it.",
+  }}
+  quiz={{
+    question: "What is the limitation of relying only on Kubernetes' built-in resource kinds?",
+    options: [
+      { text: "They can only run one pod each." },
+      { text: "They describe generic infrastructure, not your specific domain concepts, so complex apps have no native noun.", correct: true },
+      { text: "They cannot be created with kubectl." },
+    ],
+  }}
+>
+
+Every object you've met so far came from Kubernetes' built-in vocabulary: Pod,
+Service, Deployment, StatefulSet, PersistentVolumeClaim. These are deliberately
+*generic* — they describe infrastructure in the abstract, the raw materials any
+application is assembled from.
+
+But your domain has its own nouns. "A PostgreSQL cluster with one primary, two
+replicas, automated failover, and nightly backups to S3" is a real, meaningful thing
+— and Kubernetes has no word for it. You *can* build it out of a StatefulSet, some
+Services, a few CronJobs, and a pile of Secrets, but then "the database" exists only
+in your head and your YAML; the cluster sees disconnected primitives, not a database.
+
+Here's the quietly radical part of Kubernetes' design: its vocabulary is **open**.
+You can teach the cluster brand-new nouns — first-class object kinds it will store,
+validate, serve over the API, and let you manage with `kubectl`, exactly like the
+built-in ones. And once a new noun exists, you can attach behavior to it using the
+one idea this whole book has been circling. This final chapter is where the platform
+becomes *extensible*, and where Chapter 1's control loop comes back to close the
+loop — literally.
+
+</Section>
+
+<Section
+  id="crds"
+  title="CustomResourceDefinitions: new kinds in the API"
+  brief={{
+    problem: "To make the cluster understand a new noun, you need to register it with the API server so it can be created, stored, and queried like any resource.",
+    mechanism: "A CustomResourceDefinition (CRD) declares a new kind — its name, group, and schema — and the API server begins serving it immediately.",
+    cost: "A CRD on its own is inert: it makes the cluster store your objects, but nothing acts on them yet.",
+    takeaway: "A CRD extends the API with a new kind, but it adds vocabulary, not behavior.",
+  }}
+  quiz={{
+    question: "After you apply a CustomResourceDefinition for a 'Database' kind and create a Database object, what happens?",
+    options: [
+      { text: "A real database is provisioned automatically." },
+      { text: "The object is stored and served by the API, but nothing acts on it — a CRD alone is inert.", correct: true },
+      { text: "The API server rejects it as an unknown kind." },
+    ],
+  }}
+>
+
+The mechanism for adding a noun is the **CustomResourceDefinition**, or **CRD**.
+It's itself a Kubernetes object, and applying it registers a brand-new kind with the
+API server:
+
+```yaml
+kind: CustomResourceDefinition
+metadata: { name: databases.example.com }
+spec:
+  group: example.com
+  names: { kind: Database, plural: databases, singular: database }
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema: { ... }    # what fields a Database has, validated by the API server
+```
+
+The moment that's applied, `Database` is a real kind. You can write one in YAML,
+`kubectl apply` it, `kubectl get databases`, store it in etcd, and apply RBAC to it
+— everything the built-in kinds get, your new noun gets too:
+
+```yaml
+kind: Database
+metadata: { name: orders-db }
+spec:
+  engine: postgres
+  version: "16"
+  replicas: 3
+  storageGi: 20
+```
+
+But here's the catch, and it's essential to understand: a CRD adds **vocabulary, not
+behavior.** Creating that `orders-db` object does *not* spin up a Postgres cluster.
+The API server faithfully stores a record that says "someone wants a 3-replica
+Postgres 16 with 20Gi" — and then does nothing about it. The object just sits there,
+inert. You've taught the cluster a word; you haven't taught it to *act* on the word.
+
+<Callout type="note">
+This separation is intentional and clean. The CRD's job is purely to make the API
+understand and validate a new kind. *Acting* on instances of that kind is a separate
+job — and you already know exactly what kind of thing does that job, because you met
+it in Chapter 1.
+</Callout>
+
+</Section>
+
+<Section
+  id="operators"
+  title="The Operator pattern: a CRD plus a controller"
+  brief={{
+    problem: "A CRD stores your desired domain object, but something must continuously make reality match it — provision, heal, upgrade, back up.",
+    mechanism: "An Operator pairs a CRD with a custom controller running the same observe-compare-act loop from Chapter 1, applied to your domain logic.",
+    takeaway: "An Operator encodes the knowledge of a human operator as a reconciling controller, so the cluster runs your software the way an expert would.",
+  }}
+  quiz={{
+    question: "What two pieces make up the Operator pattern?",
+    options: [
+      { text: "A Dockerfile and a container registry." },
+      { text: "A CustomResourceDefinition plus a custom controller running a reconcile loop on instances of it.", correct: true },
+      { text: "An Ingress and a Service." },
+    ],
+  }}
+>
+
+The thing that acts on your new noun is a **controller** — and the marriage of a CRD
+with a controller built for it is the **Operator pattern**. Stated plainly:
+
+> An **Operator** = a **CustomResourceDefinition** (the new noun) + a **custom
+> controller** that runs a reconcile loop over instances of it.
+
+And that reconcile loop is not a new idea. It is *exactly* the four steps from
+Chapter 1, the ones every built-in controller runs:
+
+1. **Observe** the `Database` objects that exist, and the real-world state.
+2. **Compare** what's declared (`replicas: 3`, Postgres 16, 20Gi) to what's running.
+3. **Act** to close the gap.
+4. Repeat. Forever.
+
+Walk it through. You create `orders-db` declaring a 3-replica Postgres. The operator's
+controller is *watching* `Database` objects; it sees a new one with no corresponding
+reality, and reconciles: it creates a StatefulSet, the Services, the Secrets, the
+backup CronJob — all the primitives you'd have assembled by hand, now assembled by
+the loop. Edit `orders-db` to `replicas: 5`, and the loop notices the gap and scales
+up. A pod dies; the loop heals it. A backup is due; the loop runs it. The operator is
+doing, continuously and automatically, what a skilled human database operator would
+do — which is exactly why it's called an *Operator*. It's **operational expertise
+encoded as a control loop.**
+
+This is the satisfying payoff of the whole book. Self-healing replicas, rescheduling,
+service endpoints, dynamic storage provisioning — every one was the same loop pointed
+at a different slice of the world. The Operator pattern hands *you* that loop. You
+define the noun, you write the controller, and now Kubernetes manages *your* domain
+with the same tireless reconciliation it brings to its own.
+
+</Section>
+
+<Section
+  id="real-world"
+  title="In the wild: the Prometheus Operator"
+  brief={{
+    problem: "Running a monitoring stack by hand means wiring scrape configs, storage, and alerting rules — and re-doing it whenever targets change.",
+    mechanism: "The Prometheus Operator defines CRDs like Prometheus and ServiceMonitor; its controller reconciles a full, self-updating monitoring stack from them.",
+    takeaway: "Operators are how much of the Kubernetes ecosystem ships today — complex systems delivered as a noun plus a loop.",
+  }}
+  quiz={{
+    question: "How does the Prometheus Operator let you run monitoring declaratively?",
+    options: [
+      { text: "It defines CRDs (like Prometheus and ServiceMonitor) whose controller reconciles a full monitoring stack to match them.", correct: true },
+      { text: "It replaces the API server with Prometheus." },
+      { text: "It runs a single static pod you configure by hand." },
+    ],
+  }}
+>
+
+This isn't theory — it's how a huge share of the modern Kubernetes ecosystem is
+built. The **Prometheus Operator** is the canonical example. Install it and you get
+new nouns: `Prometheus`, `ServiceMonitor`, `Alertmanager`, `PrometheusRule`. To stand
+up monitoring, you don't hand-edit scrape configs; you declare objects:
+
+```yaml
+kind: Prometheus
+metadata: { name: main }
+spec:
+  replicas: 2
+  serviceMonitorSelector: { matchLabels: { team: backend } }
+  retention: 15d
+```
+
+The operator's controller reconciles that into a running, highly-available Prometheus
+with 15-day retention and storage. Then `ServiceMonitor` objects declare *what* to
+scrape by label selector — and as your services come and go, the operator notices and
+rewrites Prometheus's configuration automatically. Monitoring becomes declarative,
+self-updating, and managed by the same `kubectl apply` workflow as everything else.
+
+The same pattern powers cert-manager (a `Certificate` noun that becomes an issued,
+auto-renewed TLS cert), database operators, message-queue operators, and countless
+others. Each puts domain logic *inside* Kubernetes rather than bolting automation on
+around it.
+
+<Callout type="tip">
+That's the whole arc of this book in one sentence: Kubernetes is a machine for
+running control loops against declared state, and the Operator pattern lets you point
+that machine at *anything you can describe.* Once you see every component — built-in
+or custom — as the same loop over a different noun, the platform stops being a pile
+of features and becomes a single, coherent idea.
+</Callout>
+
+You started by trying to keep one service alive by hand and feeling it fall apart.
+You end able to teach the cluster your own nouns and let it keep *those* alive too.
+Same loop, all the way up.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Extending the API and the Operator pattern are documented both in the core reference
+and in the broader community materials that popularized the approach.
+
+- **Kubernetes Documentation — *Custom Resources* and *CustomResourceDefinitions*.**
+  How new kinds are defined, validated, and served by the API.
+  `kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/`
+- **Kubernetes Documentation — *Operator pattern*.** The canonical description of
+  pairing a custom resource with a reconciling controller.
+  `kubernetes.io/docs/concepts/extend-kubernetes/operator/`
+- **Prometheus Operator — project documentation.** A production example of CRDs plus
+  a controller running a real monitoring stack. `prometheus-operator.dev`
+- **Dobies & Wood, *Kubernetes Operators* (O'Reilly, 2020).** A book-length treatment
+  of designing operators and the reconciliation model behind them.
+
+That's the end of the journey. From one container on one machine to a control loop
+you can extend yourself — you now have the whole shape of Kubernetes, and the one
+idea that ties every piece of it together.
+
+</Section>
+
+</ChapterReader>

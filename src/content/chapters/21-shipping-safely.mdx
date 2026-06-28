@@ -1,0 +1,232 @@
+---
+title: "Shipping Safely"
+chapterNumber: 21
+summary: "Replacing a live service is where production gets nervous. This chapter shows how a Deployment rolls out a new version a few Pods at a time, how readiness probes stall a bad rollout before users feel it, and how blue-green, canary, and GitOps turn 'deploy' from a held breath into the Chapter 1 reconcile loop, pointed at delivery."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import { gitopsNodes } from '@/data/production';
+
+<ChapterReader chapterId="21-shipping-safely">
+
+<Section
+  id="the-held-breath"
+  title="The held breath"
+  brief={{
+    problem: "Shipping v2 over a live v1 risks a window where the site is down, or worse, where everyone is suddenly served a broken build.",
+    mechanism: "Treat a release as a change to desired state and let a controller close the gap carefully — never all at once.",
+    takeaway: "A good rollout is just reconciliation with guardrails, not a risky one-shot cutover.",
+  }}
+  quiz={{
+    question: "What is the core risk a deployment strategy is designed to manage?",
+    options: [
+      { text: "Running out of disk space." },
+      { text: "A window where users are down or are all served a broken new version at once.", correct: true },
+      { text: "Using too many YAML files." },
+    ],
+  }}
+>
+
+You have three copies of `web:v1` serving traffic. You want `web:v2` live. The
+naive move — stop all three, start three new ones — gives you a window where the
+site is simply down. The other naive move — swap them all at once the instant v2
+is built — means that if v2 is broken, *everyone* hits the breakage
+simultaneously. Either way you're holding your breath.
+
+Kubernetes removes the held breath by refusing to treat a release as a single
+risky event. A new version is just a **change to desired state**: you say "the
+Deployment should now run `web:v2`," and a controller closes the gap the same way
+it closes every other gap — gradually, watching as it goes. The rest of this
+chapter is about the guardrails that make "gradually, watching" safe enough to do
+on a Friday.
+
+</Section>
+
+<Section
+  id="rolling"
+  title="Rolling updates, a few at a time"
+  brief={{
+    problem: "Replacing every Pod at once is all-or-nothing; you want to swap versions while staying up and capable of stopping mid-way.",
+    mechanism: "A Deployment's rolling update replaces old Pods with new ones incrementally, bounded by maxUnavailable and maxSurge.",
+    takeaway: "maxUnavailable caps how far below capacity you dip; maxSurge caps how many extra Pods spin up to speed the roll.",
+  }}
+  quiz={{
+    question: "What does maxSurge control during a rolling update?",
+    options: [
+      { text: "How many Pods may be missing below the desired count." },
+      { text: "How many extra Pods, above the desired count, may be created to move the rollout along.", correct: true },
+      { text: "How fast the container image downloads." },
+    ],
+  }}
+>
+
+The default strategy for a **Deployment** is the **rolling update**: it replaces
+old Pods with new ones a few at a time, so the service stays up throughout. Two
+knobs bound how aggressive that is:
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 25%   # how far below desired capacity we may dip
+    maxSurge: 25%         # how many extra Pods we may add to go faster
+```
+
+**maxUnavailable** is your floor: with three replicas and `25%`, the rollout will
+never let more than (rounded) one Pod be missing at a time, so you keep serving.
+**maxSurge** is your ceiling for *extra* Pods — it lets the Deployment briefly run
+above the desired count so a new Pod can come up *before* an old one goes down,
+trading a little extra capacity for a faster, gap-free roll. Behind the scenes the
+Deployment does this by managing two **ReplicaSets**, scaling the new one up as it
+scales the old one down.
+
+</Section>
+
+<Section
+  id="probes-gate"
+  title="Readiness probes hold the gate"
+  brief={{
+    problem: "Rolling in new Pods is only safe if you can tell a started Pod from a ready one — a process can be running yet unable to serve.",
+    mechanism: "A readiness probe must pass before a Pod receives traffic or counts as available; a failing probe stalls the rollout instead of advancing it.",
+    cost: "A rollout that can't pass readiness will halt — by design — rather than replace good Pods with bad ones.",
+    takeaway: "The readiness probe is what makes a rolling update safe: no traffic reaches a Pod that isn't ready.",
+  }}
+  quiz={{
+    question: "v2's Pods start but never pass their readiness probe. What happens to the rollout?",
+    options: [
+      { text: "It finishes anyway and sends users to the unready Pods." },
+      { text: "It stalls with old Pods still serving, because new Pods never become available.", correct: true },
+      { text: "It deletes the old Pods first to make room." },
+    ],
+  }}
+>
+
+A rolling update is only as safe as your ability to tell "the process started"
+from "the app can actually serve." That distinction is the **readiness probe** —
+a check (an HTTP GET, a TCP connect, a command) that a Pod must pass before the
+Service sends it traffic and before the Deployment counts it as available.
+
+This single mechanism is what makes the whole thing safe. Suppose `v2` boots but
+fails its `/healthz` check — a bad config, a missing dependency. Because those
+Pods never become *ready*, the Deployment never counts them as available, so it
+**stalls** the rollout with the old, healthy Pods still serving. Your users never
+touch the broken version. The rollout didn't need to be clever; it just refused
+to advance past unready Pods.
+
+<Callout type="tip">
+If something does slip through, recovery is one command:
+`kubectl rollout undo deploy/web` scales the previous ReplicaSet back up and the
+bad one down — an instant rollback to the last known-good version, using the same
+rolling machinery in reverse.
+</Callout>
+
+</Section>
+
+<Section
+  id="canary-bluegreen"
+  title="Blue-green and canary"
+  brief={{
+    problem: "Sometimes a rolling update isn't cautious enough — you want a fast escape hatch, or to test the new version on real traffic before committing.",
+    mechanism: "Blue-green runs the new version fully in parallel and flips traffic in one switch; canary sends a small slice of traffic to the new version and watches its metrics before ramping.",
+    cost: "Both buy safety with extra resources or extra orchestration.",
+    takeaway: "Choose a strategy by how much blast radius you can tolerate while a new version proves itself.",
+  }}
+  quiz={{
+    question: "What defines a canary release?",
+    options: [
+      { text: "Running two full copies of the app and flipping all traffic at once." },
+      { text: "Sending a small fraction of traffic to the new version, watching its metrics, then ramping up only if it stays healthy.", correct: true },
+      { text: "Deploying only at night." },
+    ],
+  }}
+>
+
+When a plain rolling update isn't cautious enough, two patterns trade extra
+machinery for an even smaller blast radius.
+
+**Blue-green** runs the new version (*green*) fully in parallel with the current
+one (*blue*). You verify green out of band, then flip all traffic in a single
+switch at the router or Service. The cutover is instant and so is the rollback —
+flip back to blue — but you pay for two full copies of the app at once.
+
+**Canary** is the opposite shape: keep most traffic on the old version and route a
+small slice — say `5%` — to the new one. Then you *watch the signals from the last
+chapter*: error rate, latency, saturation. If the canary stays healthy you ramp to
+`25%`, then `100%`; if it degrades, you pull it and almost no one was affected.
+Canary is observability and rollout working together — you can only ramp safely
+because you can *see* whether the new version is hurting.
+
+</Section>
+
+<Section
+  id="gitops"
+  title="GitOps: the reconcile loop, applied to delivery"
+  brief={{
+    problem: "Even safe rollouts drift into chaos if humans hand-apply YAML to prod — no audit trail, no obvious source of truth, no clean rollback.",
+    mechanism: "Put desired state in a Git repo and let a controller (Argo CD, Flux) continuously reconcile the cluster to the repo, correcting drift automatically.",
+    takeaway: "GitOps is the Chapter 1 control loop lifted to deployment: repo is desired, cluster is actual, the loop closes the gap.",
+  }}
+  quiz={{
+    question: "In GitOps, what is the source of truth for what runs in the cluster?",
+    options: [
+      { text: "Whatever someone last typed into kubectl." },
+      { text: "A Git repository that a controller continuously reconciles onto the cluster.", correct: true },
+      { text: "The container registry." },
+    ],
+  }}
+>
+
+There's still a human problem. If engineers `kubectl apply` straight to
+production, the cluster's real state slowly diverges from anything written down —
+no audit trail, no single source of truth, and a rollback means remembering what
+the world looked like before.
+
+**GitOps** fixes this with an idea you already met in Chapter 1. Put the
+declarative desired state — all your manifests — in a **Git repository**, and run
+a controller (**Argo CD** or **Flux**) whose entire job is a loop: compare the
+cluster to the repo, and correct any difference. Deploying is now a *commit*; the
+controller notices the repo changed and reconciles the cluster to match. If
+someone hand-edits the cluster, the controller notices *that* drift too and pulls
+it back to what the repo says.
+
+<Figure number="21.1" caption="GitOps is reconciliation pointed at delivery: the repo holds desired state, the cluster is actual state, and a controller closes the gap continuously. Click each side.">
+  <Diagram client:visible id="ch21-gitops" title="Reconciling cluster to repo" nodes={gitopsNodes} />
+</Figure>
+
+Look at what that buys you. The repo is the single source of truth, so the
+cluster's state is always *reviewable* — it's just files. Every change is a
+reviewed, audited commit. A rollback is `git revert`. And drift heals itself,
+because the loop never stops watching. This is the same **observe → compare →
+act** loop that runs your replicas and your nodes, now running your *releases*. By
+the time you reach GitOps, it shouldn't feel like a new idea — it should feel like
+the oldest idea in the book, finally pointed at the thing you were most afraid to
+automate.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Rollouts and GitOps are well-trodden ground; start here.
+
+- **Kubernetes Documentation — *Deployments* (rolling updates, `maxSurge` /
+  `maxUnavailable`, rollback) and *Configure Liveness, Readiness and Startup
+  Probes*.** `kubernetes.io/docs/concepts/workloads/controllers/deployment/`
+- **Argo CD Documentation — *Core Concepts*.** A reference implementation of the
+  reconcile-the-cluster-to-the-repo model. `argo-cd.readthedocs.io`
+- **Weaveworks, *GitOps: Operations by Pull Request* (2017).** The essay that
+  named the pattern and tied it to declarative, version-controlled state.
+
+Next chapter: rollouts go wrong, Pods get stuck, and someone has to read the
+wreckage. *When It Breaks* is a hands-on troubleshooting playbook for exactly
+those mornings.
+
+</Section>
+
+</ChapterReader>

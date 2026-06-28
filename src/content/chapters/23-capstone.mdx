@@ -1,0 +1,244 @@
+---
+title: "Capstone: Ship to Production"
+chapterNumber: 23
+summary: "Everything in this book converges here. This is a guided checklist you can actually follow to take an app from a container on your laptop to a resilient, observable, GitOps-managed production service — each step reusing an idea you've already earned. Then it closes the loop and sends you off to build."
+readingTime: "24 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import { capstoneNodes } from '@/data/production';
+
+<ChapterReader chapterId="23-capstone">
+
+<Section
+  id="the-checklist"
+  title="From laptop to production"
+  brief={{
+    problem: "Knowing each Kubernetes concept in isolation is not the same as knowing the order to apply them in to ship something real.",
+    mechanism: "A checklist sequences the whole book — package, declare, expose, configure, bound, scale, observe, deliver — into one followable path.",
+    takeaway: "Production readiness is a sequence of earned steps, not a single deploy command.",
+  }}
+  quiz={{
+    question: "What is this capstone checklist for?",
+    options: [
+      { text: "Memorizing YAML field names." },
+      { text: "Sequencing the book's ideas into an order you can actually follow to ship an app.", correct: true },
+      { text: "Replacing the need to understand any of it." },
+    ],
+  }}
+>
+
+You've met every piece. This chapter assembles them in the order you'd actually
+use to put a stateless web app into production. Treat the sections that follow as
+a **checklist** — each step names the artifact, the reason it exists, and the
+chapter where you earned it. None of it is new; the value is the *sequence*.
+
+We'll build up a single app: a container, wrapped in a Deployment, exposed
+through a Service and Ingress, configured by a ConfigMap and Secret, bounded by
+requests and limits, kept honest by probes, scaled by an HPA, watched by your
+observability stack, and delivered by GitOps. By the end you'll have a manifest
+set that is genuinely production-shaped — and a mental model for why each line is
+there.
+
+</Section>
+
+<Section
+  id="package-and-declare"
+  title="Package it, then declare it"
+  brief={{
+    problem: "Code on a laptop can't be scheduled; and a bare Pod won't survive a crash or a node failure.",
+    mechanism: "Build an immutable image tagged by commit, then wrap it in a Deployment so a controller keeps the desired replica count alive.",
+    takeaway: "The image is the unit of shipping; the Deployment is the unit of keeping-it-alive.",
+  }}
+  quiz={{
+    question: "Why run your app under a Deployment instead of as a bare Pod?",
+    options: [
+      { text: "Bare Pods are faster." },
+      { text: "A Deployment's controller maintains the desired replica count and gives you rolling updates and rollback.", correct: true },
+      { text: "Bare Pods cannot use images." },
+    ],
+  }}
+>
+
+**Step 1 — Containerize (Chapters 2–3).** Package the app as an immutable
+**image**. Keep it small, run as a non-root user, and tag it with the commit SHA
+— never `latest`, so every deploy is traceable to a commit:
+
+```bash
+docker build -t registry.example.com/web:$(git rev-parse --short HEAD) .
+docker push registry.example.com/web:abc1234
+```
+
+**Step 2 — Declare the workload (Chapter 1, and the workloads chapters).** Wrap
+the image in a **Deployment**. Its controller runs the reconcile loop that has
+been the spine of this whole book: it keeps the declared number of replicas alive
+and gives you safe rolling updates and instant rollback for free.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: web }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: web } }
+  template:
+    metadata: { labels: { app: web } }
+    spec:
+      containers:
+        - name: web
+          image: registry.example.com/web:abc1234
+```
+
+That's a living, self-healing app. Now make it reachable.
+
+</Section>
+
+<Section
+  id="expose-and-configure"
+  title="Expose it and configure it"
+  brief={{
+    problem: "Pods have ephemeral IPs and no public entry point, and baking config or secrets into the image makes it unshippable across environments.",
+    mechanism: "A Service gives the Pods one stable address; an Ingress routes external traffic to it; a ConfigMap and Secret inject config without rebuilding.",
+    takeaway: "Expose with Service + Ingress; configure with ConfigMap + Secret — the image stays identical across environments.",
+  }}
+  quiz={{
+    question: "Which chain correctly exposes a stateless web app to the public internet?",
+    options: [
+      { text: "A bare Pod with a public IP." },
+      { text: "Deployment (Pods) → Service (stable in-cluster address) → Ingress (external HTTP routing).", correct: true },
+      { text: "A ConfigMap pointed at the internet." },
+    ],
+  }}
+>
+
+**Step 3 — Expose it (the networking and Service chapters).** A **Service** gives
+your Pods one stable virtual address and load-balances across the healthy ones,
+so callers never chase ephemeral Pod IPs. An **Ingress** sits at the edge: it
+routes external HTTP/HTTPS by host and path to that Service and terminates TLS.
+
+<Figure number="23.1" caption="The public request path: an Ingress routes outside traffic to a Service, which load-balances across the Deployment's Pods. Click each piece.">
+  <Diagram client:visible id="ch23-path" title="How traffic reaches your Pods" nodes={capstoneNodes} />
+</Figure>
+
+**Step 4 — Configure without rebuilding (the config chapters).** Put non-secret
+settings in a **ConfigMap** and credentials in a **Secret**, then inject them as
+environment variables or mounted files. The *same image* now runs unchanged in
+dev, staging, and prod — only the attached config differs. (Recall Chapter 22: a
+missing `DATABASE_URL` is exactly a ConfigMap/Secret wiring bug. This is where you
+prevent it.)
+
+</Section>
+
+<Section
+  id="bound-and-scale"
+  title="Bound it, probe it, scale it"
+  brief={{
+    problem: "Without resource bounds the scheduler can't place Pods safely; without probes, traffic hits Pods that aren't ready; without autoscaling, you're back to watching graphs.",
+    mechanism: "Set requests/limits, add readiness/liveness probes, and attach an HPA so capacity tracks load on its own.",
+    takeaway: "Requests + limits + probes + HPA are the non-negotiable backbone of a production-safe workload.",
+  }}
+  quiz={{
+    question: "Why set both resource requests and a readiness probe before going to production?",
+    options: [
+      { text: "They only matter in development." },
+      { text: "Requests let the scheduler place Pods and let the HPA compute utilization; the readiness probe keeps traffic off Pods until they're actually ready.", correct: true },
+      { text: "They make the container image smaller." },
+    ],
+  }}
+>
+
+**Step 5 — Set requests, limits, and probes (Chapters 19–21).** This is
+non-negotiable for production. **Requests** are how the scheduler reasons about
+capacity and how the HPA computes utilization; **limits** cap the blast radius of
+a leak (and prevent noisy-neighbor `OOMKilled` surprises); **readiness/liveness
+probes** keep traffic off Pods that aren't ready and restart ones that wedge.
+
+```yaml
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits:   { memory: 256Mi }
+readinessProbe:
+  httpGet: { path: /healthz, port: 8080 }
+livenessProbe:
+  httpGet: { path: /healthz, port: 8080 }
+```
+
+**Step 6 — Scale automatically (Chapter 19).** Attach a **HorizontalPodAutoscaler**
+so replicas follow real load between sensible bounds, and rely on the **Cluster
+Autoscaler** to grow the node pool when Pods would otherwise go `Pending`. Now the
+9am spike resizes the fleet without anyone awake to do it.
+
+<Callout type="warning">
+Skip the requests and the whole upper half of this list quietly breaks: the
+scheduler bin-packs blindly, the HPA has no utilization to read, and one greedy
+Pod can starve its neighbors. Requests are the small, boring field that makes
+everything above it possible.
+</Callout>
+
+</Section>
+
+<Section
+  id="observe-and-deliver"
+  title="Observe it, then deliver it by GitOps"
+  brief={{
+    problem: "An app you can't see is an app you can't operate, and an app you hand-apply to prod has no audit trail or clean rollback.",
+    mechanism: "Expose metrics and ship logs for observability, then commit every manifest to a repo and let a controller reconcile the cluster to it.",
+    takeaway: "Observability tells you what's happening; GitOps makes the repo the source of truth that heals its own drift.",
+  }}
+  quiz={{
+    question: "What does delivering this app via GitOps give you?",
+    options: [
+      { text: "A faster container build." },
+      { text: "A Git repo as the audited source of truth that a controller continuously reconciles, so drift self-heals and rollback is git revert.", correct: true },
+      { text: "Permission to skip readiness probes." },
+    ],
+  }}
+>
+
+**Step 7 — Make it observable (Chapter 20).** Expose a `/metrics` endpoint for
+**Prometheus**, ship container stdout through your node log agent, and write
+**alerting** rules on error rate and latency so you hear about trouble before
+your users tweet about it. This is also what makes a safe **canary** possible —
+you can only ramp a new version if you can watch it.
+
+**Step 8 — Deliver with GitOps (Chapter 21).** Commit every manifest from steps
+2–7 to a repo and let **Argo CD** or **Flux** reconcile the cluster to it.
+Production is now the repo: each change is a reviewed PR, each rollback is a
+`git revert`, and drift heals itself because the loop never stops. The final step
+is the first idea in the book — observe, compare, act — pointed at the entire
+system at once.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+This checklist is a synthesis; these references are where the official guidance
+on "production-ready" lives.
+
+- **Kubernetes Documentation — *Configuration Best Practices* and *Production
+  environment*.** The platform's own checklist for resource requests, probes,
+  labels, and image policy. `kubernetes.io/docs/setup/best-practices/`
+- **Kubernetes Documentation — *Ingress*, *Service*, *ConfigMaps*, and
+  *Secrets*.** The reference for the exposure-and-configuration layer assembled
+  in steps 3–4.
+- **Burns, Beda, Hightower & Evenson, *Kubernetes Up & Running* (O'Reilly).** A
+  book-length walk through the same end-to-end path, with deeper worked examples.
+
+And that's the book. You started by trying to keep one container alive by hand and
+feeling exactly where it broke; you end able to ship a self-healing, observable,
+auto-scaling, GitOps-delivered service — and to explain *why* every piece is
+there, because each one arrived as the answer to a problem you'd already felt. The
+control loop you met in Chapter 1 turned out to be the whole engine: it keeps your
+replicas, your nodes, your rollouts, and now your entire production system true to
+what you declared. There's nothing left to read for. Go declare a desired state,
+and build something.
+
+</Section>
+
+</ChapterReader>

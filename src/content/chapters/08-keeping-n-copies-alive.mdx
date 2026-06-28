@@ -1,0 +1,261 @@
+---
+title: "Keeping N Copies Alive"
+chapterNumber: 8
+summary: "Bare Pods die for good. You want three copies of your app that stay three copies through crashes and dead nodes — and you want to ship a new version without a moment of downtime. Those are two different jobs, and Kubernetes gives them two different controllers stacked on top of each other."
+readingTime: "24 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { rolloutTerminal } from '@/data/core';
+
+<ChapterReader chapterId="08-keeping-n-copies-alive">
+
+<Section
+  id="the-count"
+  title="The job: hold a count steady"
+  brief={{
+    problem: "Chapter 7 left you with mortal Pods. You want three copies of your app that stay three through crashes, OOM kills, and dead nodes — without you watching.",
+    mechanism: "A controller that does nothing but compare 'how many Pods match this template' to 'how many I want' and create or delete to close the gap.",
+    takeaway: "Keeping N copies alive is just the Chapter 1 control loop pointed at a replica count.",
+  }}
+  quiz={{
+    question: "What is the single, narrow job of the controller that keeps your app's replicas alive?",
+    options: [
+      { text: "To roll out new versions of your app." },
+      { text: "To continuously ensure the number of matching Pods equals the number you declared, creating or deleting to match.", correct: true },
+      { text: "To assign Pods to nodes." },
+    ],
+  }}
+>
+
+We ended the last chapter with a problem: bare Pods don't self-heal. Lose the
+node and the Pod is gone for good. What you actually want is to say "three copies
+of `web`, always" and never think about it again — through crashes, out-of-memory
+kills, and machines that catch fire at 3am.
+
+That is a control loop, and you already know its shape from Chapter 1: observe
+actual, compare to desired, act to close the gap, repeat. The thing that runs
+this loop for replica counts is the **ReplicaSet**. Its whole job — the entire
+job, nothing more — is to make a number true. You tell it `replicas: 3`, hand it
+a Pod template, and it spends the rest of its life asking one question: *are
+there three healthy Pods that match?* Two? It creates one. Four? It deletes one.
+Three? It does nothing and asks again.
+
+This is why "self-healing" isn't a feature someone bolted on. Kill a Pod by hand
+and a new one appears in seconds — not because Kubernetes is clever, but because
+a loop noticed `2 ≠ 3` and acted. The healing *is* the loop. Once you see the
+ReplicaSet as nothing but the replica-count instance of the universal control
+loop, it stops being a new concept and becomes the same old one wearing a job
+title.
+
+</Section>
+
+<Section
+  id="labels-selectors"
+  title="How a controller knows which Pods are 'its'"
+  brief={{
+    problem: "To count 'its' Pods, a ReplicaSet must know which of the many Pods in the cluster belong to it. Hard references would break the moment a Pod is replaced.",
+    mechanism: "Pods carry labels (app: web); the controller has a selector (match app: web). Ownership is by matching labels, not by name or pointer.",
+    takeaway: "Labels and selectors are the loose coupling that lets controllers own a changing set of Pods without naming any of them.",
+  }}
+  quiz={{
+    question: "How does a ReplicaSet decide which Pods count toward its replica total?",
+    options: [
+      { text: "It keeps a hard-coded list of Pod names it created." },
+      { text: "It uses a label selector — any Pod whose labels match the selector is 'its' Pod, by membership not by name.", correct: true },
+      { text: "It owns every Pod on the same node." },
+    ],
+  }}
+>
+
+There's a hole to fill before the count makes sense. The cluster is full of Pods
+from many apps. When a ReplicaSet asks "are there three of mine?", how does it
+know which Pods are *its*? It can't keep a list of names — the names change every
+time a Pod is replaced, which is constantly.
+
+Kubernetes solves this the same way it solves almost every "which objects relate
+to which" question: **labels and selectors**. A label is just a key-value tag you
+stick on an object — `app: web`, `tier: frontend`, `env: prod`. A selector is a
+query over labels. The ReplicaSet carries a selector like `app: web`, and *any*
+Pod whose labels match is considered one of its replicas. Ownership is by
+membership in a set, not by a pointer to a name.
+
+This loose coupling is quietly powerful. The ReplicaSet doesn't track individual
+Pods; it tracks a *population* defined by a query. Replace a Pod and the new one,
+stamped with the same `app: web` label from the template, is automatically
+counted. It's the difference between "I'm responsible for Pods #7, #8, #9" — which
+breaks the moment #7 dies — and "I'm responsible for the set of Pods labeled
+`app: web`," which survives any amount of churn.
+
+<Callout type="warning">
+Because ownership is by label match, overlapping selectors are a real footgun.
+If two controllers both select `app: web`, they'll fight over the same Pods —
+each seeing the other's Pods as surplus and deleting them. Keep selectors
+distinct, and let controllers manage the labels for you rather than hand-editing
+Pod labels in a running set.
+</Callout>
+
+</Section>
+
+<Section
+  id="the-update-problem"
+  title="The problem a ReplicaSet can't solve"
+  brief={{
+    problem: "A ReplicaSet pins one version of a Pod template. To ship v2 you'd have to edit it in place — and the obvious ways either cause downtime or can't roll back.",
+    mechanism: "Deleting all v1 Pods at once means an outage; editing live is irreversible. You need a controller that orchestrates the swap gradually and remembers the old version.",
+    takeaway: "A ReplicaSet keeps one version alive; it has no notion of changing versions safely. That's a different job.",
+  }}
+  quiz={{
+    question: "Why isn't a ReplicaSet enough to ship a new version of your app safely?",
+    options: [
+      { text: "A ReplicaSet can only manage one Pod at a time." },
+      { text: "It only knows how to hold one template steady — it has no mechanism to transition from v1 to v2 gradually or to roll back.", correct: true },
+      { text: "ReplicaSets can't run more than three replicas." },
+    ],
+  }}
+>
+
+The ReplicaSet is great at one thing and blind to another. It holds *one* Pod
+template steady. But that template pins a specific image — `web:v1`. What happens
+when you want `web:v2`?
+
+Your bad options, if a ReplicaSet were all you had:
+
+- **Edit the template in place and delete all the Pods.** The ReplicaSet recreates
+  them with v2 — but for a few seconds there are *zero* Pods serving traffic. An
+  outage on every deploy.
+- **Edit the template and wait.** A ReplicaSet doesn't actually replace existing
+  Pods when you change its template; it only applies the new template to Pods it
+  creates *next*. So nothing happens until Pods happen to die. The rollout is
+  nondeterministic and might never finish.
+- **And if v2 is broken?** You've destroyed the v1 Pods. There's no saved copy of
+  the old working state to fall back to. Rollback means redeploying v1 by hand and
+  hoping.
+
+The missing capability is *managing change over time*: bring up v2 gradually,
+take down v1 in step, keep the service at full strength throughout, and keep the
+old version around in case v2 misbehaves. That's not a tweak to the ReplicaSet's
+job — it's a whole separate job that *uses* ReplicaSets as its building blocks.
+Enter the Deployment.
+
+</Section>
+
+<Section
+  id="deployment"
+  title="The Deployment: managing ReplicaSets"
+  brief={{
+    problem: "You need version transitions that never drop below full strength and can be undone instantly.",
+    mechanism: "A Deployment manages multiple ReplicaSets — one per version — scaling a new one up while scaling the old one down, keeping old ones at zero for rollback.",
+    cost: "You briefly run two versions at once and a few extra Pods (maxSurge) during the shift.",
+    takeaway: "A Deployment is a controller of controllers: it choreographs ReplicaSets to make change safe.",
+  }}
+  quiz={{
+    question: "How does a Deployment perform a zero-downtime rolling update?",
+    options: [
+      { text: "It edits the running Pods in place, one field at a time." },
+      { text: "It creates a new ReplicaSet for v2 and shifts capacity gradually — scaling the new one up and the old one down — so the service never drops below strength.", correct: true },
+      { text: "It deletes the old ReplicaSet, then creates the new one." },
+    ],
+  }}
+>
+
+A **Deployment** sits one level above ReplicaSets and choreographs them. You
+don't usually create ReplicaSets yourself; you create a Deployment, and it
+creates and manages ReplicaSets for you. The reason for the extra layer is
+entirely about handling *change* safely.
+
+When you update a Deployment — say, change the image to `web:v2` — it does not
+touch the existing Pods. Instead it creates a **new ReplicaSet** for v2 and
+performs a **rolling update**: it scales the new ReplicaSet up a little and the
+old one down a little, over and over, until the new one holds all the replicas
+and the old one holds zero. Two parameters tune the dance: `maxSurge` (how many
+extra Pods it may create above the desired count) and `maxUnavailable` (how many
+it may take down at once). With sensible values, your service never drops below
+full strength — old Pods keep serving until new ones are `Ready`.
+
+The old ReplicaSet isn't deleted; it's kept around scaled to zero. That detail is
+what makes **rollback** trivial: the previous working version is sitting right
+there, one command from being scaled back up.
+
+<Figure number="8.1" caption="Three layers, each declarative: the Deployment records which version you want; each ReplicaSet holds one version's Pods steady; Pods are the running instances. `kubectl get rs` shows the new ReplicaSet at 3 and the old one parked at 0.">
+  <KubectlTerminal client:visible id="ch8-term" commands={rolloutTerminal} />
+</Figure>
+
+So the stack is three controllers deep, each reconciling toward the layer above:
+the **Deployment** says *which version*, a **ReplicaSet** says *how many of one
+version*, and **Pods** are the running copies. Change the top, and the change
+ripples down safely.
+
+</Section>
+
+<Section
+  id="rollout-rollback"
+  title="Watching and undoing a rollout"
+  brief={{
+    problem: "A safe deploy mechanism is worthless if you can't see whether it finished or reverse it the instant something looks wrong.",
+    mechanism: "kubectl rollout status follows the transition live; kubectl rollout undo scales the previous ReplicaSet back up. History is kept per revision.",
+    takeaway: "Because old ReplicaSets are retained, rollback is just 'scale the previous one back up' — fast and built in.",
+  }}
+  quiz={{
+    question: "You ship v2, it's clearly broken, and you run `kubectl rollout undo deployment/web`. What actually happens under the hood?",
+    options: [
+      { text: "Kubernetes rebuilds v1 from source." },
+      { text: "The Deployment scales the retained v1 ReplicaSet back up and the v2 one down — reversing the rolling update.", correct: true },
+      { text: "It deletes the whole Deployment and asks you to recreate it." },
+    ],
+  }}
+>
+
+A safe rollout mechanism is only useful if you can watch it and reverse it. Both
+are first-class.
+
+`kubectl rollout status deployment/web` follows the transition live, printing
+progress as old Pods are retired and new ones become ready, and exiting when the
+Deployment has fully converged. It's the command you'd put in a deploy script's
+"wait until healthy" step, because it blocks until the new version is genuinely
+serving.
+
+When v2 turns out to be broken — and it will, eventually — `kubectl rollout undo
+deployment/web` reverses the move. Because the v1 ReplicaSet is still sitting at
+zero replicas, "undo" simply scales it back up and the v2 one back down, the same
+rolling update run in reverse. No rebuild, no scramble; you're back to the last
+known-good version in seconds. `kubectl rollout history` shows you the revisions
+you can return to.
+
+Step back and notice what you've gained since the bare Pod of Chapter 7. You no
+longer name Pods, count them by hand, restart them, or sweat a deploy. You declare
+a version and a replica count; a tower of control loops keeps that true and lets
+you change your mind safely. This is the Kubernetes promise delivered in full for
+*one* app on *one* set of Pods. The remaining problem is that those Pods keep
+changing their IP addresses — so how does anything reliably *talk* to them? That's
+the next chapter.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Deployments and ReplicaSets are where the control-loop philosophy becomes the
+tool you use every day.
+
+- **Kubernetes Documentation — *Deployments* and *ReplicaSet*.** The definitive
+  reference for rolling-update parameters, revision history, and selectors.
+  `kubernetes.io/docs/concepts/workloads/controllers/deployment/`
+- **Kubernetes Documentation — *Labels and Selectors*.** Why ownership is by
+  label match and how to keep selectors from overlapping.
+- **Hightower, Burns & Beda, *Kubernetes: Up and Running* (O'Reilly), the
+  Deployments chapter.** A walkthrough of rollout strategies and rollback in
+  practice.
+
+Next chapter: those self-healing Pods keep getting new IP addresses as they're
+replaced. We put one stable address and name in front of the whole moving set —
+the Service.
+
+</Section>
+
+</ChapterReader>

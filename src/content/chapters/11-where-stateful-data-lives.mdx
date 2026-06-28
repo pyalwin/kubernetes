@@ -1,0 +1,225 @@
+---
+title: "Where Stateful Data Lives"
+chapterNumber: 11
+summary: "Everything that makes Pods great — disposable, rescheduled, replaced — is a disaster for a database. A container's filesystem vanishes on restart. This chapter builds up the storage stack that lets data outlive the Pod using it: volumes, then PersistentVolumes and the claims that bind to them."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { storageBindNodes, storageTerminal } from '@/data/core';
+
+<ChapterReader chapterId="11-where-stateful-data-lives">
+
+<Section
+  id="ephemeral"
+  title="The disappearing filesystem"
+  brief={{
+    problem: "Everything that makes Pods great — disposable, replaced, rescheduled — destroys data. A container's writable layer is thrown away every time it restarts.",
+    mechanism: "The container's filesystem is the image's read-only layers plus a thin writable layer that lives and dies with the container.",
+    takeaway: "Container storage is ephemeral by default; stateful apps need storage that outlives the container.",
+  }}
+  quiz={{
+    question: "Your database container restarts. What happens to data it wrote to its own container filesystem?",
+    options: [
+      { text: "It's preserved automatically across restarts." },
+      { text: "It's gone — the writable layer is ephemeral and discarded when the container is replaced.", correct: true },
+      { text: "It's moved into etcd for safekeeping." },
+    ],
+  }}
+>
+
+Every virtue we've built up has a dark side for one kind of app. Pods are
+disposable; controllers replace them freely; the scheduler moves work between
+nodes. Wonderful for a stateless web server — catastrophic for a database.
+
+The root of the trouble is how a container's filesystem works. Recall from early
+on that an image is a stack of *read-only* layers. When a container runs, it gets
+one thin **writable layer** on top, and anything it writes goes there. That
+writable layer is born with the container and **dies with it**. Restart the
+container — a crash, an OOM kill, a rolling update — and you get a *fresh* writable
+layer. Whatever the old one held is discarded.
+
+For a stateless app this is a feature: every Pod starts clean and identical. But a
+database's entire job is to *remember*. If its files live in that writable layer,
+then the first crash, the first node failure, the first deploy wipes the database.
+The very disposability that makes Pods reliable makes them, by default, amnesiac.
+
+So we need storage that is *not* part of the container — storage with a lifetime
+of its own, that a Pod can attach to and that survives the Pod being restarted,
+rescheduled, or replaced. Kubernetes builds that up in layers, starting small with
+the Volume and ending with cluster-wide persistent storage. We'll climb that
+ladder one rung at a time.
+
+</Section>
+
+<Section
+  id="volumes"
+  title="Volumes: storage attached to a Pod"
+  brief={{
+    problem: "Two containers in a Pod need to share files, and a container needs scratch space that survives its own restart — neither works with the ephemeral writable layer.",
+    mechanism: "A Volume is storage defined on the Pod and mounted into containers; it outlives container restarts and is how Pod containers share files.",
+    cost: "A basic Volume's lifetime is still tied to the Pod — delete the Pod and an emptyDir is gone.",
+    takeaway: "A Volume survives container restarts and enables sharing, but a plain Volume still dies with the Pod.",
+  }}
+  quiz={{
+    question: "How long does the data in a Pod's `emptyDir` volume last?",
+    options: [
+      { text: "Forever, even after the Pod is deleted." },
+      { text: "As long as the Pod exists — it survives container restarts but is deleted when the Pod is.", correct: true },
+      { text: "Only until the container that wrote it restarts." },
+    ],
+  }}
+>
+
+The first rung is the **Volume**. A Volume is storage declared on the *Pod* and
+mounted into one or more of its containers. Because it belongs to the Pod rather
+than to a single container's writable layer, it solves two problems at once.
+
+First, it survives **container restarts**. If a container crashes and the kubelet
+restarts it within the same Pod, a Volume mounted into it keeps its contents. The
+ephemeral writable layer resets; the Volume doesn't.
+
+Second, it enables **sharing between containers** in a Pod — the mechanism we
+waved at back in Chapter 7. The app writes logs to a Volume mounted at
+`/var/log/app`; the sidecar mounts the same Volume and reads them. That shared
+patch of filesystem is a Volume.
+
+There are many Volume types. `emptyDir` is scratch space created empty when the
+Pod starts — great for caches and inter-container handoff. The `configMap` and
+`secret` mounts from Chapter 10 are Volume types too. But here's the ceiling: a
+plain Volume's lifetime is tied to the **Pod**. An `emptyDir` is created with the
+Pod and **deleted with it**. So a Volume survives a *container* restart but not the
+*Pod* being deleted and rescheduled — which is exactly the event a database must
+survive. We've climbed one rung and we're still not high enough.
+
+</Section>
+
+<Section
+  id="pv-pvc"
+  title="PersistentVolume and PersistentVolumeClaim"
+  brief={{
+    problem: "Durable storage must outlive the Pod entirely, but the app developer shouldn't have to know whether it's an AWS disk, NFS, or something else.",
+    mechanism: "Split storage in two: a PersistentVolume is a real piece of cluster storage; a PersistentVolumeClaim is a request for storage. Kubernetes binds a claim to a matching volume.",
+    takeaway: "PV/PVC decouples 'who provides storage' from 'who needs it' — the same request-based indirection as Services and Pods.",
+  }}
+  quiz={{
+    question: "What is the difference between a PersistentVolume and a PersistentVolumeClaim?",
+    options: [
+      { text: "A PVC is the storage; a PV is the request for it." },
+      { text: "A PV is a real piece of cluster storage that exists independently of any Pod; a PVC is a user's request that Kubernetes binds to a matching PV.", correct: true },
+      { text: "They're the same object with two names." },
+    ],
+  }}
+>
+
+The top rung introduces storage with a life entirely its own, and it does so by
+**splitting the concept in two** — separating who *provides* storage from who
+*needs* it.
+
+A **PersistentVolume (PV)** is a real piece of storage in the cluster: an AWS EBS
+disk, a GCE persistent disk, an NFS export, a slice of a storage system. It's a
+cluster-level object that exists *independently of any Pod*. An administrator can
+create PVs ahead of time, or a **StorageClass** can provision them dynamically on
+demand. Either way, a PV represents actual, durable capacity that doesn't vanish
+when a Pod does.
+
+A **PersistentVolumeClaim (PVC)** is a *request* for storage, written by the
+application developer: "I need 10Gi that I can read and write." The PVC says what
+the app *needs* — size, access mode — without naming a specific disk. The Pod
+references the **claim**, never the PV directly. Click through the chain:
+
+<Figure number="11.1" caption="The request-based split: a Pod mounts a PVC (a request); Kubernetes binds that PVC to a matching PV (real cluster storage). The Pod never names the disk.">
+  <Diagram client:visible id="storage-bind" title="Pod → PVC → PV" nodes={storageBindNodes} />
+</Figure>
+
+This is the same indirection you've now seen three times. A Service lets callers
+name a stable identity instead of a Pod IP; a Deployment lets you declare a count
+instead of managing Pods; a PVC lets an app *request* storage instead of knowing
+where it physically lives. The developer asks for "10Gi, read-write"; whether
+that's backed by EBS in prod or a local disk on your laptop is somebody else's
+concern. Decoupling by request is one of the deepest patterns in the whole system.
+
+</Section>
+
+<Section
+  id="access-modes-bind"
+  title="Access modes and the bind"
+  brief={{
+    problem: "Not all storage can be used the same way — some can be written by one node, some read by many — and a claim has to be matched to a volume that can satisfy it.",
+    mechanism: "A PVC specifies an access mode (RWO/ROX/RWX); Kubernetes binds it to a PV that offers at least that capability, then the Pod mounts the claim.",
+    takeaway: "The access mode is the compatibility contract; the bind is Kubernetes pairing a claim with a volume that honors it.",
+  }}
+  quiz={{
+    question: "A PVC requests ReadWriteOnce (RWO). What does that tell Kubernetes about how the storage may be used?",
+    options: [
+      { text: "Any number of nodes may read and write it simultaneously." },
+      { text: "It can be mounted read-write by a single node at a time — so it must bind to a PV that supports RWO.", correct: true },
+      { text: "It can only ever be read, never written." },
+    ],
+  }}
+>
+
+When you request storage you also state *how* it needs to be mounted, because
+storage backends genuinely differ in what they allow. This is the **access mode**,
+and it's the compatibility contract between a claim and a volume:
+
+- **ReadWriteOnce (RWO)** — mounted read-write by a single node at a time. The
+  most common mode; it fits block storage like cloud disks, and it's what a typical
+  single-instance database wants.
+- **ReadOnlyMany (ROX)** — mounted read-only by many nodes at once. Good for
+  shared static assets.
+- **ReadWriteMany (RWX)** — mounted read-write by many nodes simultaneously. Only
+  some backends (like NFS) support it, because concurrent multi-writer access is
+  genuinely hard.
+
+The **bind** is the moment Kubernetes pairs your claim with a volume that can
+honor it. You create a PVC asking for "10Gi, RWO"; the control plane finds an
+existing PV that's at least that big and supports RWO (or dynamically provisions
+one via the StorageClass), and binds them together one-to-one. From that point the
+PVC is `Bound`, and your Pod mounts it like any volume. Watch the pairing:
+
+<Figure number="11.2" caption="`kubectl get pvc` shows the claim Bound to a volume; `kubectl get pv` shows the same volume bound back to the claim (`default/data-web`). The bind is one-to-one.">
+  <KubectlTerminal client:visible id="ch11-term" commands={storageTerminal} />
+</Figure>
+
+<Callout type="tip">
+The payoff is what happens on reschedule. If the Pod's node dies and the Pod is
+recreated elsewhere, the storage follows the *claim*, not the node — the new Pod
+re-mounts the same PV and the data is intact. That is durability surviving exactly
+the churn Pods were designed to endure.
+</Callout>
+
+The storage lives on, bound to a claim, while Pods come and go above it. With that
+in place, Part II has given every workload what it needs: identity, replication, a
+stable address, configuration, and now durable data. The last chapter zooms back
+out to the cluster as a shared resource — how many teams safely split one cluster
+without trampling each other.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The PV/PVC split is the foundation everything stateful in Kubernetes sits on —
+StatefulSets, databases, the lot.
+
+- **Kubernetes Documentation — *Volumes*, *Persistent Volumes*, and *Storage
+  Classes*.** The reference for volume types, the PV/PVC lifecycle, access modes,
+  and dynamic provisioning. `kubernetes.io/docs/concepts/storage/`
+- **Kubernetes Documentation — *Configure a Pod to Use a PersistentVolume for
+  Storage*.** A hands-on walkthrough of the claim-and-bind flow.
+- **Container Storage Interface (CSI) specification.** How storage vendors plug
+  real backends into the PV abstraction.
+
+Next chapter: we pull back to the cluster as a shared resource — namespaces that
+keep teams apart, and the requests and limits that decide who gets what compute.
+
+</Section>
+
+</ChapterReader>

@@ -1,0 +1,259 @@
+---
+title: "The Network, Deeper"
+chapterNumber: 15
+summary: "You've used Services and cluster DNS. Now go under them: how a pod gets an IP at all (the CNI and its flat network), how outside HTTP traffic reaches the right service (Ingress), and how you turn a wide-open default-allow network into one that only permits the traffic you intend (NetworkPolicy)."
+readingTime: "24 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import { ingressFlowNodes } from '@/data/advanced';
+
+<ChapterReader chapterId="15-the-network-deeper">
+
+<Section
+  id="cni"
+  title="The CNI: who hands out pod IPs"
+  brief={{
+    problem: "Pods need IP addresses and a network they can all reach each other on, but Kubernetes itself doesn't implement networking.",
+    mechanism: "Kubernetes defines an interface (the CNI) and delegates to a plugin that assigns each pod an IP on a flat network where any pod can reach any other directly.",
+    takeaway: "The flat, NAT-free pod network is a model the CNI plugin must deliver — Services and DNS are layered on top of it.",
+  }}
+  quiz={{
+    question: "Who actually assigns a pod its IP address and wires up its network?",
+    options: [
+      { text: "The API server, directly." },
+      { text: "A CNI plugin (Calico, Cilium, Flannel…) that Kubernetes calls when a pod is created.", correct: true },
+      { text: "etcd, from a pool of reserved addresses." },
+    ],
+  }}
+>
+
+You've been addressing pods through Services and DNS names without ever asking the
+prior question: where does a pod's IP *come from*? The surprising answer is that
+Kubernetes doesn't know. It deliberately doesn't implement pod networking at all.
+
+Instead it defines an interface — the **CNI**, the Container Network Interface — and
+delegates the actual work to a plugin you choose: **Calico**, **Cilium**,
+**Flannel**, and others. When the kubelet creates a pod, it calls the CNI plugin,
+which assigns the pod an IP address and wires up its virtual network interface so
+packets can flow. Different clusters run different plugins; the contract between them
+and Kubernetes is what stays fixed.
+
+That contract specifies one crucial property: the plugin must build a **flat
+network**. Every pod gets its own routable IP, and **any pod can reach any other
+pod's IP directly** — across nodes, with no NAT in between. There are no per-node IP
+silos to bridge, no port-mapping gymnastics. From any pod, another pod's IP just
+works.
+
+<Callout type="note">
+This flat network is the foundation everything you already know sits on. A Service's
+stable virtual IP and a DNS name resolve, ultimately, to these raw pod IPs the CNI
+handed out. When you "talk to a Service," you're using a convenient, stable handle
+over the flat pod network underneath.
+</Callout>
+
+The pluggability matters in practice: your CNI choice determines not just
+performance but which *features* you get — most importantly, whether you can enforce
+network policy, which we reach at the end of this chapter.
+
+</Section>
+
+<Section
+  id="kube-proxy"
+  title="How a Service IP actually works"
+  brief={{
+    problem: "A Service's virtual IP is stable, but no network interface anywhere actually owns that address — so how does a packet sent to it reach a real pod?",
+    mechanism: "kube-proxy runs on every node and programs the kernel (iptables or IPVS rules) to rewrite traffic for a Service's virtual IP to one of its current pod IPs.",
+    cost: "The rules must be continuously updated as pods come and go, which is itself a control loop watching the Service's endpoints.",
+    takeaway: "A Service is not a process in the data path — it's a set of kernel rules kube-proxy keeps in sync with the live pods.",
+  }}
+  quiz={{
+    question: "What makes traffic sent to a Service's virtual IP actually arrive at a real pod?",
+    options: [
+      { text: "A load-balancer process the Service runs, which proxies every request." },
+      { text: "kube-proxy programs kernel rules on each node that rewrite the virtual IP to a current pod IP.", correct: true },
+      { text: "The API server forwards each packet individually." },
+    ],
+  }}
+>
+
+A Service hands you a stable virtual IP, and you've trusted it without asking the
+awkward question: *no machine actually has that IP.* It's not assigned to any pod or
+any network card. So when a pod sends a packet to a Service's address, what catches
+it and where does it go?
+
+The answer is **kube-proxy**, a component running on every node. Despite the name it
+usually doesn't proxy traffic itself — instead it programs the **Linux kernel**. It
+watches the Service and its current set of backing pods (its *endpoints*), and writes
+kernel rules — classically **iptables** rules, or **IPVS** for larger clusters — that
+say: "packets destined for this virtual IP, rewrite them to one of *these* real pod
+IPs." The kernel does the rewriting at line speed; there's no extra hop through a
+proxy process in the common case.
+
+The crucial part is that this is, once again, a **control loop**. Pods backing a
+Service are constantly churning — scaling, crashing, rolling. Each time the endpoint
+set changes, kube-proxy observes the change and rewrites the kernel rules to match,
+so the virtual IP always resolves to *currently healthy* pods. The stability you
+experience at the Service IP is manufactured, continuously, on every node, out of
+rules over the flat pod network the CNI built.
+
+<Callout type="note">
+This is why a Service "just works" even though pods behind it come and go: you're not
+relying on a fragile process staying up, you're relying on kernel rules that a loop
+keeps current. The same observe-compare-act pattern, now pointed at packet-forwarding
+rules.
+</Callout>
+
+</Section>
+
+<Section
+  id="ingress"
+  title="Ingress: routing HTTP from the outside"
+  brief={{
+    problem: "A Service of type LoadBalancer gives one external entry point per service, can't route by URL, and gets expensive fast.",
+    mechanism: "An Ingress is an L7 router: one front door that dispatches HTTP requests to many backend Services by hostname and path, terminating TLS.",
+    cost: "An Ingress resource is just rules; you must run an IngressController (nginx, Traefik…) that actually proxies the traffic.",
+    takeaway: "Ingress consolidates many services behind one smart, HTTP-aware entry point.",
+  }}
+  quiz={{
+    question: "What does an Ingress give you that a plain Service of type LoadBalancer does not?",
+    options: [
+      { text: "Persistent storage for the backend pods." },
+      { text: "L7 HTTP routing — one entry point that dispatches to many Services by host and path, with TLS termination.", correct: true },
+      { text: "A faster pod network." },
+    ],
+  }}
+>
+
+Getting traffic *into* the cluster with what you know so far means a Service of type
+`LoadBalancer` — and that's a blunt instrument. It operates at L4 (TCP), so it can't
+look at a URL and decide where to send a request. And you'd need one per service,
+each provisioning its own cloud load balancer. Ten public services, ten load
+balancers, ten bills.
+
+An **Ingress** replaces that with a single, HTTP-aware front door. It works at L7,
+so it routes by the things HTTP actually carries — **hostname and path**:
+
+```yaml
+kind: Ingress
+spec:
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /api
+            backend: { service: { name: api, port: { number: 80 } } }
+          - path: /
+            backend: { service: { name: web, port: { number: 80 } } }
+```
+
+One entry point, fanning out: `shop.example.com/api` goes to the `api` Service,
+everything else to `web`. It also terminates TLS, so certificates live in one place.
+
+There's a catch worth stating plainly: the Ingress *resource* is only a set of
+rules — declared desired state, nothing more. Something has to *enforce* them. That
+something is an **IngressController** — `ingress-nginx`, Traefik, or a cloud
+provider's controller — a pod (often a DaemonSet) running a real proxy that watches
+Ingress objects and configures itself to match. No controller, no routing; the rules
+just sit there.
+
+Here is the path a request takes from the internet to a running pod:
+
+<Figure number="15.1" caption="The L7 path inward: the Ingress terminates TLS and routes by host/path to a Service, which load-balances over the pods. Click each stage.">
+  <Diagram client:visible id="ch15-ingress" title="Ingress → Service → Pods" nodes={ingressFlowNodes} />
+</Figure>
+
+Each stage hides the next from the one before it. The Ingress knows Services, not
+pods. The Service knows pods, but tracks their churn so the Ingress never has to.
+
+</Section>
+
+<Section
+  id="networkpolicy"
+  title="NetworkPolicy: from default-allow to least privilege"
+  brief={{
+    problem: "The flat pod network is wide open by default: any pod can connect to any pod, so one compromised pod can reach your database.",
+    mechanism: "A NetworkPolicy is a firewall in Kubernetes terms; the moment one selects a pod, that pod flips to default-deny and only the flows you whitelist get through.",
+    cost: "Policies are enforced by the CNI plugin, so a plugin without policy support silently ignores them.",
+    takeaway: "NetworkPolicies turn a permissive network into a least-privilege one, one selected pod at a time.",
+  }}
+  quiz={{
+    question: "In a namespace with no NetworkPolicies, what can a given pod connect to?",
+    options: [
+      { text: "Nothing — all traffic is denied until allowed." },
+      { text: "Any other pod — the network is default-allow until a policy restricts it.", correct: true },
+      { text: "Only pods in the same Deployment." },
+    ],
+  }}
+>
+
+The flat network the CNI built has a security cost: it is **default-allow**. Out of
+the box, every pod can open a connection to every other pod. Convenient for getting
+started, dangerous in production — a compromised frontend can reach straight into
+your database, your cache, your internal admin service. Nothing is stopping it.
+
+A **NetworkPolicy** is the fix: a firewall expressed in Kubernetes' own vocabulary
+of labels and selectors. Its behavior has one rule that trips people up, so learn it
+deliberately. By default a pod accepts all traffic. **The instant a NetworkPolicy
+selects a pod, that pod flips to default-deny** for the covered direction — and from
+then on, only the flows the policy explicitly permits get through.
+
+```yaml
+kind: NetworkPolicy
+spec:
+  podSelector:
+    matchLabels: { app: db }      # this policy governs db pods
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: api }   # ...accept ingress ONLY from api pods
+```
+
+Read it as a sentence: *pods labeled `db` accept incoming connections only from pods
+labeled `api`.* Everything else — the frontend, a random debug pod, a compromised
+workload — is now denied. You've turned an open network into a least-privilege one
+for exactly the pods that matter, without touching the others.
+
+<Callout type="warning">
+NetworkPolicies are enforced by the **CNI plugin**, not by Kubernetes itself. If
+your cluster runs a plugin that doesn't implement policy, your carefully written
+rules are accepted by the API server and then silently do nothing. Confirm your CNI
+supports NetworkPolicy before you rely on it as a security boundary.
+</Callout>
+
+This closes the loop on the chapter. The CNI gives you a flat network where anything
+can reach anything; Ingress gives you a controlled way *in* from outside;
+NetworkPolicy gives you control over the *internal* flows the flat network left wide
+open. Together they're the shape of a real cluster's network.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The networking documentation is split across the cluster-networking model, the
+Ingress concept, and the NetworkPolicy concept — each worth reading in full.
+
+- **Kubernetes Documentation — *Cluster Networking* and *Network Plugins*.** The
+  flat-network model and how the CNI fits in.
+  `kubernetes.io/docs/concepts/cluster-administration/networking/`
+- **Kubernetes Documentation — *Ingress* and *Ingress Controllers*.** What an
+  Ingress declares and why a controller is required to enforce it.
+  `kubernetes.io/docs/concepts/services-networking/ingress/`
+- **Kubernetes Documentation — *Network Policies*.** The default-allow-to-deny
+  model, selectors, and ingress/egress rules.
+  `kubernetes.io/docs/concepts/services-networking/network-policies/`
+
+Next chapter: pods that hold data need disks that outlive them. We go under
+PersistentVolumes to the CSI, StorageClasses, and dynamic provisioning — how a claim
+for storage becomes a real disk, automatically.
+
+</Section>
+
+</ChapterReader>

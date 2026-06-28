@@ -1,0 +1,328 @@
+---
+title: "What a Container Actually Is"
+chapterNumber: 2
+summary: "Chapter 1 treated a container as a sealed bundle and moved on. Now we open it. A container is not a tiny virtual machine — it is one ordinary Linux process that the kernel has been tricked into isolating, running on a filesystem assembled from stacked layers."
+readingTime: "22 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { containerAnatomyNodes, containerInspectTerminal } from '@/data/foundations';
+
+<ChapterReader chapterId="02-what-a-container-is">
+
+<Section
+  id="not-a-vm"
+  title="The thing it is not"
+  brief={{
+    problem: "Almost everyone's first mental model of a container is 'a lightweight virtual machine,' and that model quietly poisons every later intuition about cost, speed, and isolation.",
+    mechanism: "A VM boots a whole guest kernel on emulated hardware; a container is a normal process on the host's own kernel, sharing it with every other container.",
+    cost: "The wrong model makes you expect VM-grade isolation and VM-grade startup time, and you misjudge both.",
+    takeaway: "A container is a process, not a machine. Everything else in this chapter follows from that one fact.",
+  }}
+  quiz={{
+    question: "What is the single biggest structural difference between a container and a virtual machine?",
+    options: [
+      { text: "A container is smaller because it compresses its files more aggressively." },
+      { text: "A VM runs its own guest kernel on virtual hardware; a container is a process sharing the host's single kernel.", correct: true },
+      { text: "Containers can only run web servers, while VMs run anything." },
+    ],
+  }}
+>
+
+The fastest way to understand a container is to be clear about what it *isn't*.
+When people first meet containers, they reach for the nearest familiar thing — a
+virtual machine — and assume a container is just a smaller, faster one. That
+guess is wrong in a way that matters, and unlearning it now saves you a dozen
+confusions later.
+
+A **virtual machine** is a pretend computer. A hypervisor carves out virtual
+hardware — a fake CPU, fake disk, fake network card — and on top of that hardware
+you boot an entire operating system, kernel and all. Two VMs on one server are
+two complete, separate kernels that happen to share some silicon. That is why a
+VM takes tens of seconds to boot and hundreds of megabytes of memory just to
+exist: you are starting a whole computer.
+
+A **container** boots nothing. There is no second kernel, no virtual hardware,
+no operating system starting up. When you run a container, the host kernel — the
+one already running on the machine — simply starts a normal process, the same
+way it starts your text editor or your shell. That process shows up in the host's
+process table with an ordinary PID. You can see it. You can `kill` it.
+
+So why does the process *feel* like it lives in its own little world — its own
+files, its own network, its own list of running programs? Because the kernel has
+agreed to lie to it. Through a handful of features we'll name shortly, the kernel
+hands that one process a private, curated view of the system and quietly enforces
+limits on what it can touch. The isolation is real, but it is *isolation within a
+shared kernel*, not a second computer.
+
+<Callout type="warning" title="Why the distinction earns its keep">
+Because containers share the host kernel, they start in milliseconds and cost
+almost nothing to keep idle — that is the whole reason you can pack dozens onto a
+node. But it also means a kernel-level exploit can, in principle, reach across
+containers in a way it cannot reach across VMs. "Process, not machine" explains
+both the speed *and* the security caveat in one stroke.
+</Callout>
+
+</Section>
+
+<Section
+  id="image-vs-container"
+  title="Template versus instance"
+  brief={{
+    problem: "People say 'container' for two different things — the file you download and the program that runs — and conflating them makes images, registries, and restarts confusing.",
+    mechanism: "An image is an immutable, read-only template on disk; a container is a running (or stopped) instance the kernel created from that template.",
+    takeaway: "Image is to container as class is to object, or recipe is to meal: one is the frozen template, the other is the live thing.",
+  }}
+  quiz={{
+    question: "You run the same image three times and get three containers. What is the relationship?",
+    options: [
+      { text: "Each container is a separate copy of the image, edited independently." },
+      { text: "One immutable image acted as a read-only template for three independent running instances.", correct: true },
+      { text: "The three containers are the same process shown three times." },
+    ],
+  }}
+>
+
+There is a vocabulary trap that trips up nearly everyone, and clearing it up is
+worth a whole section. The word "container" gets used for two genuinely
+different things: the *thing on disk you download* and the *thing that runs*.
+Keeping them separate makes the rest of this book easier.
+
+An **image** is a template. It is an immutable, read-only package sitting on
+disk: a frozen snapshot of a filesystem — application binary, libraries, config
+files — plus a little metadata saying which command to run and which environment
+to set. An image does nothing. It has no PID, no memory, no CPU usage. It is
+inert, like a `.zip` you haven't opened, or a recipe card that has never met a
+kitchen.
+
+A **container** is what you get when the kernel brings an image to life: a
+running (or paused, or stopped) *instance* created from that template. The kernel
+takes the image's frozen filesystem, gives it the disguises from the previous
+section, and starts the command the image specified. *That* is the process with a
+PID.
+
+The relationship is exactly the one programmers know as class-to-object: the
+image is the class, each container an instance. Run one image five times and you
+get five containers — five independent processes, each with its own memory and
+its own scratch space — all reading from the *same* unchanging template. One
+recipe, five meals.
+
+This is why **immutability** is such a load-bearing idea. Because the image never
+changes, a container started from `nginx:1.27` on your laptop is byte-for-byte
+the same template as the one a colleague starts in a datacenter. "Works on my
+machine" stops being a shrug and becomes a guarantee. And when Kubernetes needs
+to replace a crashed copy, it doesn't repair anything — it throws the instance
+away and stamps out a fresh one from the same template. Cattle, not pets. Hold
+onto that: the control loop from Chapter 1 can only "just make another one"
+because the template it stamps from never drifts.
+
+<Figure number="2.1" caption="One immutable image on disk; three independent running instances. The template never changes — each container gets its own life.">
+  <KubectlTerminal client:visible id="ch2-docker" commands={containerInspectTerminal} prompt="$" />
+</Figure>
+
+Try the session above: `docker images` lists templates, `docker run` stamps out
+an instance, `docker ps` shows it running, and `ps -e` proves the running thing
+is just a normal process on the host.
+
+</Section>
+
+<Section
+  id="layers"
+  title="How images are built: layers"
+  brief={{
+    problem: "If every image were one monolithic blob, downloading and storing hundreds of nearly-identical images would waste enormous bandwidth and disk.",
+    mechanism: "An image is a stack of read-only layers, each a filesystem diff. Shared base layers are stored and transferred exactly once.",
+    takeaway: "Layering turns images from heavy blobs into cheap, deduplicated diffs — which is why pulls are fast and disk stays sane.",
+  }}
+  quiz={{
+    question: "Ten images all built 'FROM ubuntu:24.04'. How much disk does that shared base consume?",
+    options: [
+      { text: "Ten copies — one full base per image." },
+      { text: "One copy — the shared base layer is stored once and referenced by all ten.", correct: true },
+      { text: "None — base layers are recomputed on every run." },
+    ],
+  }}
+>
+
+An image isn't a single sealed blob. It is a **stack of layers**, and that design
+choice is the reason container workflows feel light instead of crushing.
+
+Each layer is a set of filesystem changes — a diff. The bottom layer might be a
+minimal Linux userland (`FROM ubuntu:24.04`). The next layer is whatever changed
+when you installed your language runtime. The next is your application's
+dependencies. The top is your own code. Stack them in order, merge them, and you
+get a complete root filesystem — but it is *built up* from independently stored,
+read-only slices.
+
+Two properties fall out of this, and both are why the ecosystem works at scale:
+
+- **Layers are shared.** That `ubuntu:24.04` base is content-addressed: identified
+  by a hash of its bytes. Pull a hundred images built on it and the base is
+  stored on disk *once* and transferred over the network *once*. Every image that
+  references that hash reuses the same copy. Disk and bandwidth stay flat instead
+  of multiplying.
+- **Only changes move.** Rebuild your app after a one-line code edit and only the
+  top layer changes; its hash is new, every layer below it is unchanged. Pushing
+  the new image uploads a few kilobytes, not the whole hundreds of megabytes. The
+  registry already has the rest.
+
+A natural question: if all the layers are *read-only*, how does a running
+container write a log file or a temp file? When the kernel starts a container, it
+adds one more layer on top — a thin, **writable** layer that belongs to that
+single instance. Reads fall through the stack to wherever the file lives; writes
+land in the top layer, leaving the shared read-only layers pristine. That is also
+why deleting a container is cheap and safe: you discard its tiny writable layer,
+and the shared template underneath is untouched, ready for the next instance.
+
+We'll see in the next chapter that this stacking is performed by a real kernel
+feature — a *union filesystem* — not by copying files around. For now the picture
+is enough: an image is layers; layers are shared diffs; a running container adds a
+private writable layer on top.
+
+</Section>
+
+<Section
+  id="registries-dockerfiles"
+  title="Where images come from: Dockerfiles and registries"
+  brief={{
+    problem: "Layers and immutability are great, but you still need a repeatable way to build an image and a shared place to store and fetch it.",
+    mechanism: "A Dockerfile is a script whose steps each produce a layer; a registry is a content-addressed server that hosts images for pulling and pushing.",
+    takeaway: "Build with a Dockerfile, publish to a registry, pull by name and tag — this is the supply chain Kubernetes pulls from.",
+  }}
+  quiz={{
+    question: "What is a container registry's job?",
+    options: [
+      { text: "It runs your containers for you on rented hardware." },
+      { text: "It stores and serves images by name, tag, and content hash, so any machine can pull the exact bytes.", correct: true },
+      { text: "It compiles your source code into a binary." },
+    ],
+  }}
+>
+
+Two more pieces and the container supply chain is complete: how an image is
+*built*, and where it *lives*.
+
+A **Dockerfile** is the build recipe — a short, ordered script. Each significant
+instruction produces exactly one layer, which ties directly back to the previous
+section:
+
+```dockerfile
+FROM ubuntu:24.04            # layer 0: the base userland
+RUN apt-get install -y nginx # layer 1: install the web server
+COPY ./site /var/www/html    # layer 2: add your content
+CMD ["nginx", "-g", "daemon off;"]  # metadata: what to run
+```
+
+You run a build tool over this, and it executes each step in a throwaway
+container, snapshots the filesystem diff as a layer, and moves on. The ordering
+matters for caching: put the things that rarely change (the base, the
+dependencies) near the top and the things that change constantly (your code) near
+the bottom, and most rebuilds reuse every cached layer but the last.
+
+The result is an image, named like `myregistry.io/web:1.4` — a **name**, a
+**tag** (`1.4`), and underneath, a content hash that pins the exact bytes. But an
+image on your laptop helps no one else. To share it, you push it to a
+**registry**: a server whose entire job is to store images and serve them by
+name. Docker Hub is the public default; cloud providers and companies run private
+ones. `docker push` uploads your layers (skipping any the registry already has);
+`docker pull` downloads them by name.
+
+This is the supply chain Kubernetes lives downstream of. When you tell the
+cluster to run `web:1.4`, it does not build anything — somewhere a node's runtime
+issues a pull against the registry, fetches the layers it's missing, assembles
+the root filesystem, and starts the process. The registry is the warehouse; the
+node is the floor where the template becomes a running thing.
+
+<Callout type="tip">
+Prefer a specific tag (`web:1.4`) or, better, a content digest over the floating
+`latest` tag. `latest` means "whatever was pushed most recently," which can
+change under you between two `pull`s on two nodes — quietly breaking the
+byte-for-byte sameness that made images trustworthy in the first place.
+</Callout>
+
+</Section>
+
+<Section
+  id="runtimes-cri"
+  title="What actually runs it: runtimes and the CRI"
+  brief={{
+    problem: "Something concrete has to turn 'run web:1.4' into real kernel calls — and Kubernetes must not be hard-wired to one vendor's tool to do it.",
+    mechanism: "A container runtime (containerd) pulls images and asks the kernel to create containers; Kubernetes talks to it through a stable contract, the Container Runtime Interface.",
+    takeaway: "Kubernetes schedules; a runtime executes. The CRI is the seam between them, which is why Docker could leave without the cluster noticing.",
+  }}
+  quiz={{
+    question: "Why can Kubernetes work with containerd, CRI-O, or others interchangeably?",
+    options: [
+      { text: "It ships a copy of every runtime and picks one at random." },
+      { text: "It talks to whatever runtime implements the Container Runtime Interface, a stable contract that hides the differences.", correct: true },
+      { text: "All runtimes are secretly the same program with different names." },
+    ],
+  }}
+>
+
+We've assembled the parts — process, image, layers, registry — but something has
+to do the actual work of turning a name into a running process. That something is
+a **container runtime**, and seeing where it sits explains a piece of Kubernetes
+trivia that confused a lot of people in 2020.
+
+When a node is told to run `web:1.4`, the runtime is what acts. It pulls the
+image's layers from the registry, stacks them into a root filesystem, asks the
+kernel to set up the isolation (the disguises from this chapter, detailed in the
+next), and starts the process. On most clusters today that runtime is
+**containerd**. Below it sits an even lower-level piece, `runc`, that makes the
+final kernel calls to bring the container into existence. It's runtimes all the
+way down, each layer doing a smaller, more concrete job.
+
+Now the design question Kubernetes had to answer: it must not be welded to one
+runtime. Tying the scheduler to a single vendor's tool would be a strategic dead
+end. So Kubernetes defines a contract — the **Container Runtime Interface
+(CRI)** — a standard API that says "here is how the cluster will ask you to pull
+an image, create a container, start it, stop it." *Any* runtime that implements
+the CRI can plug in: containerd, CRI-O, others. The cluster doesn't know or care
+which; it only knows the contract.
+
+<Figure number="2.2" caption="A container, fully disassembled: an ordinary process given a private view (namespaces), hard limits (cgroups), and a layered root filesystem. Click each part.">
+  <Diagram client:visible id="ch2-anatomy" title="What a container is made of" nodes={containerAnatomyNodes} />
+</Figure>
+
+This seam is the whole reason "Kubernetes is deprecating Docker" caused a panic
+and then turned out to be a non-event. Kubernetes had never spoken to Docker
+directly for very long; it spoke through the CRI, and Docker's daemon needed a
+little adapter (`dockershim`) to fit that contract. Removing the adapter changed
+nothing about your images or your Pods — `containerd`, which Docker itself uses
+under the hood, kept doing the work. The contract held; the implementation behind
+it swapped out. That is exactly the kind of clean seam the rest of Kubernetes is
+built from.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+This chapter's claim — that a container is a process plus namespaces plus cgroups
+plus a layered filesystem — is the standard model these primary sources describe
+in depth.
+
+- **Open Container Initiative (OCI) — *Image Specification* and *Runtime
+  Specification*.** The canonical, vendor-neutral definitions of what an image
+  (layers, manifest, config) and a running container actually are.
+  `github.com/opencontainers`
+- **Kubernetes Documentation — *Container Runtimes* and *Container Runtime
+  Interface (CRI)*.** How the cluster delegates execution to containerd or CRI-O.
+  `kubernetes.io/docs/setup/production-environment/container-runtimes/`
+- **containerd documentation.** The architecture of the runtime most clusters use
+  to pull images and drive `runc`. `containerd.io`
+
+Next chapter: we named three disguises — namespaces, cgroups, and the layered
+filesystem — and waved at them. Now we take each apart and watch the exact kernel
+features that let one process believe it has a computer to itself.
+
+</Section>
+
+</ChapterReader>

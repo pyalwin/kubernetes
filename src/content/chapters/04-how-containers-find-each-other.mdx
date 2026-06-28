@@ -1,0 +1,264 @@
+---
+title: "How Containers Find Each Other"
+chapterNumber: 4
+summary: "Every container got its own network namespace and its own IP — and that immediately breaks things. Those IPs are ephemeral: a container that restarts comes back at a new address, so anything that memorized the old one is now talking to nobody. This chapter builds the fix from first principles — TCP/IP, the moving-IP problem, DNS as stable indirection, and load balancing across replicas — which is exactly the problem a Service solves."
+readingTime: "21 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { podNetworkNodes, serviceDiscoveryTerminal } from '@/data/foundations';
+
+<ChapterReader chapterId="04-how-containers-find-each-other">
+
+<Section
+  id="addresses"
+  title="Talking over a network at all"
+  brief={{
+    problem: "Two containers, each in its own network namespace with its own IP, need to exchange data — but 'send some bytes to that program over there' hides a lot of machinery.",
+    mechanism: "TCP/IP: an IP address names a host, a port names a program on it, and TCP turns the unreliable network into an ordered, reliable byte stream between an (IP, port) pair.",
+    takeaway: "A network conversation is identified by four numbers — source IP, source port, destination IP, destination port. Everything later is about keeping the destination findable.",
+  }}
+  quiz={{
+    question: "Your web container needs to reach a database container. At minimum, what does it need to know?",
+    options: [
+      { text: "Only the database's hostname; ports are automatic." },
+      { text: "An IP address to find the host and a port to reach the right program on it.", correct: true },
+      { text: "The database's internal process ID." },
+    ],
+  }}
+>
+
+Before we can talk about containers *finding* each other, we need a clear picture
+of what it even means for two programs to talk over a network. This is foundational
+plumbing — most of the time it's invisible — but the whole chapter rests on it, so
+let's build it from the ground up in one section.
+
+When one program wants to send data to another across a network, two numbers do
+the addressing:
+
+- An **IP address** identifies a *host* — a machine, or in our world, a
+  container's network namespace. Something like `10.1.2.34`. It answers "*which*
+  endpoint on the network?" Routers know how to shuttle packets toward an IP the
+  way the postal system moves mail toward a street address.
+- A **port** identifies a *program* on that host. A single container might run a
+  web server on port 80 and a metrics endpoint on port 9090. The port answers
+  "once the packet arrives, *which* listener gets it?" — the apartment number
+  after the street address.
+
+So the minimum a client needs is an **(IP, port)** pair: where the host is, and
+which door to knock on. On top of that addressing sits **TCP**, the protocol that
+turns a lossy, out-of-order packet network into something programs can actually
+use: a reliable, ordered stream of bytes. TCP handles the messy reality —
+retransmitting dropped packets, reordering ones that arrive scrambled, and slowing
+down when the network is congested — so the application just reads and writes a
+stream. (Its sibling **UDP** skips those guarantees for speed; DNS itself, which
+we'll meet shortly, often rides on UDP.)
+
+A live connection is pinned by *four* numbers — source IP, source port,
+destination IP, destination port — which is how one server can hold thousands of
+simultaneous conversations on the same port 80 without mixing them up: each
+connection's quartet is unique.
+
+Hold onto the destination half of that quartet — **destination IP and port** —
+because that's precisely the part that's about to become a problem. In a cluster,
+the *program* you want stays conceptually the same ("the web backend"), but the
+*IP* it lives at refuses to hold still.
+
+</Section>
+
+<Section
+  id="every-container-gets-an-ip"
+  title="Every container gets an IP — and that's the trap"
+  brief={{
+    problem: "In Kubernetes every Pod gets its own real, routable IP, which sounds clean — but Pods are disposable, so those IPs are short-lived by design.",
+    mechanism: "When a Pod dies and a controller replaces it, the replacement is a brand-new Pod with a brand-new IP; nothing guarantees address reuse.",
+    cost: "Any client that cached the old Pod's IP is now sending packets to an address that hosts nothing, or worse, something else.",
+    takeaway: "Pod IPs are ephemeral. Hard-coding one is building on sand — the very self-healing from Chapter 1 keeps pulling the address out from under you.",
+  }}
+  quiz={{
+    question: "A controller replaces a crashed Pod. What is true of the new Pod's IP address?",
+    options: [
+      { text: "It always reuses the dead Pod's exact IP, so clients never notice." },
+      { text: "It's typically a new, different IP — Pod addresses are ephemeral and not guaranteed to persist across restarts.", correct: true },
+      { text: "Pods don't have IPs; only nodes do." },
+    ],
+  }}
+>
+
+Here's a clean idea that comes with a sting. In Kubernetes, **every Pod gets its
+own IP address** — a real, routable one, drawn from the cluster's Pod network.
+This is called the *IP-per-Pod* model, and it's deliberately simple: a Pod looks
+like a little host on the network. No fighting over shared ports on a node, no
+remembering which container got remapped to which host port. Each Pod just *has*
+an address, and containers inside it share that address (recall from Chapter 3:
+they share a network namespace).
+
+Now collide that with the central lesson of Chapter 1: Pods are **cattle, not
+pets.** They get killed and replaced constantly — a node drains, a deploy rolls,
+a liveness check fails, the scheduler rebalances. And here's the catch: when a
+controller replaces a dead Pod, the replacement is a *brand-new Pod*. New name,
+new identity, and — critically — **a new IP address.** Nothing reuses the old
+one. The self-healing you wanted is exactly what keeps the address moving.
+
+So picture the failure. Your web Pod is told "the database lives at `10.1.2.34`,"
+and it dutifully stores that. The database Pod crashes; a controller replaces it;
+the new database Pod comes up at `10.1.5.91`. Your web Pod, none the wiser, keeps
+firing packets at `10.1.2.34` — an address that now hosts *nothing*, or, after
+enough churn, some *unrelated* Pod that just happens to have been handed that
+recycled IP. Connection refused, or quietly talking to the wrong service. Either
+way, broken.
+
+<Figure number="4.1" caption="The same logical service, two moments apart. Delete a Pod and its replacement returns with a different IP — but the Service IP and name never move. Run the session top to bottom.">
+  <KubectlTerminal client:visible id="ch4-term" commands={serviceDiscoveryTerminal} prompt="$" />
+</Figure>
+
+Run the session above and watch it happen: `get pods -o wide` shows the Pod IPs;
+delete one; list again and the address has changed. This is not a bug to be fixed
+by making Pods stable — their disposability is the whole point of the model. The
+fix has to live somewhere else: we need a layer of **indirection** between "the
+thing I want to reach" and "the IP it currently happens to live at." A stable
+name in front of a moving target.
+
+</Section>
+
+<Section
+  id="dns-indirection"
+  title="A stable name in front of a moving target"
+  brief={{
+    problem: "Clients need a fixed thing to address, but Pod IPs are the opposite of fixed.",
+    mechanism: "Add a layer of indirection: a stable name (and a stable virtual IP) that the cluster's DNS resolves to whatever Pods are currently healthy.",
+    takeaway: "Indirection is the entire trick — clients hold a name that never changes; something behind the name tracks the addresses that do.",
+  }}
+  quiz={{
+    question: "How does a stable DNS name solve the moving-IP problem?",
+    options: [
+      { text: "It freezes the Pod's IP so it can never change." },
+      { text: "It gives clients a fixed name to address, while the cluster keeps the name pointed at whatever IPs are currently valid.", correct: true },
+      { text: "It makes the network faster so restarts don't happen." },
+    ],
+  }}
+>
+
+The fix is a principle older than Kubernetes, older than the cloud: *any problem
+can be solved by adding a layer of indirection.* If the IP won't hold still, stop
+handing out IPs. Hand out a **name** that never changes, and keep a lookup table —
+maintained by something that's always watching — that maps the name to whatever
+IPs are valid *right now*.
+
+You already rely on this everywhere. You type `example.com`, not an IP address.
+The website can move to entirely new servers with new addresses and you never
+notice, because **DNS** — the Domain Name System — translates the stable name to
+the current IP at the moment you connect. The name is the promise; the IP is an
+implementation detail that's free to change behind it.
+
+Kubernetes runs a DNS service *inside* the cluster (commonly CoreDNS) doing
+exactly this job for your workloads. Instead of telling your web Pod "the database
+is at `10.1.2.34`," you tell it "the database is at `db`." When the web Pod opens
+a connection to `db`, it first asks cluster DNS, "what IP is `db`?" DNS answers
+with a current, valid address, and *then* the TCP connection from the first
+section is made to that address. The Pod code never holds an IP for longer than a
+single connection; it holds a *name*.
+
+<Callout type="note">
+Cluster DNS gives every Service a predictable name. Within a namespace you can
+reach one as just `db`; across namespaces the fully-qualified form is
+`db.<namespace>.svc.cluster.local`. The shape never depends on where the Pods
+landed or what addresses they drew — that's the stability you're buying.
+</Callout>
+
+But notice DNS alone leaves one question open. It resolves a name to an IP — fine
+when there's exactly one target. In Chapter 1 we ran *three* replicas of the web
+service for capacity and survival. So the name can't sensibly point at one Pod's
+IP; that would funnel all traffic to a single replica and break the instant that
+replica died. We need the name to front *a whole changing set* of Pods, and to
+spread work across them. That's the final piece, and it's what turns a DNS entry
+into a **Service**.
+
+</Section>
+
+<Section
+  id="load-balancing"
+  title="One name, many replicas: load balancing"
+  brief={{
+    problem: "A real service is several interchangeable replicas, not one Pod, so a single name must fan out to many backends and skip the unhealthy ones.",
+    mechanism: "Put a stable virtual IP behind the name and load-balance connections across the current set of healthy Pod IPs, updated as Pods come and go.",
+    takeaway: "A stable name + a stable virtual IP + load balancing over a live backend set is exactly what a Kubernetes Service provides.",
+  }}
+  quiz={{
+    question: "Three replicas back one Service. A client connects to the Service name. What happens?",
+    options: [
+      { text: "The client must pick one replica's IP itself and hope it's healthy." },
+      { text: "The Service resolves to a stable virtual IP and load-balances the connection to one of the currently healthy replica IPs.", correct: true },
+      { text: "All three replicas receive the request and reply three times." },
+    ],
+  }}
+>
+
+The last piece upgrades a name-to-one-IP lookup into a name-to-*many* router. A
+real service in production is a *set* of interchangeable replicas — three copies
+of `web`, any of which can serve a request. The indirection layer therefore has
+two jobs, not one: keep a **stable front** that clients address, and **spread
+incoming connections** across whatever replicas are healthy at the moment, while
+silently dropping ones that have died.
+
+Kubernetes packages exactly this as a **Service**. A Service gives you:
+
+- A **stable virtual IP** (the *ClusterIP*) and matching DNS name that *never*
+  change for the life of the Service — the fixed thing clients hold onto. It does
+  not belong to any Pod, so no Pod's death can take it down.
+- A **live set of backend Pod IPs**, the Service's *endpoints*, kept current by a
+  controller that watches Pods come and go. When a Pod with the matching label
+  appears, its IP is added; when one dies, its IP is removed — automatically,
+  using the very control-loop machinery from Chapter 1.
+- **Load balancing**: a connection to the virtual IP is routed to *one* of the
+  healthy endpoints. Traffic spreads across replicas, and a dead replica simply
+  stops being a candidate.
+
+<Figure number="4.2" caption="The full indirection chain: a client knows only a name; DNS turns it into the Service's stable virtual IP; the Service load-balances across the live set of Pod IPs, which are free to churn underneath. Click each stage.">
+  <Diagram client:visible id="ch4-net" title="Name → DNS → Service → Pods" nodes={podNetworkNodes} />
+</Figure>
+
+Trace one request through Figure 4.2 and the whole chapter lines up. The client
+holds a *name* (never changes). DNS resolves it to the Service's *virtual IP*
+(never changes). The Service load-balances onto one of the *current Pod IPs*
+(changes constantly, and that's fine — the client never sees it). Pods can crash,
+scale from three to ten, or migrate to other nodes all day long; from the client's
+seat, "talk to `web`" simply keeps working. The endpoint list churns underneath a
+surface that stays perfectly still.
+
+That stillness is the point. We started this chapter with a raw, moving Pod IP
+and a client doomed to chase it. Three layers of indirection later — name, virtual
+IP, load-balanced endpoint set — the moving target is completely hidden. The
+client's world finally holds still, even though nothing underneath does.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+This chapter reasoned from networking fundamentals up to the Service abstraction;
+these primary sources cover both ends.
+
+- **Kubernetes Documentation — *Service* and *Cluster Networking*.** The canonical
+  description of ClusterIP, endpoints, and the IP-per-Pod model.
+  `kubernetes.io/docs/concepts/services-networking/`
+- **Kubernetes Documentation — *DNS for Services and Pods*.** How in-cluster DNS
+  names are constructed and resolved (the CoreDNS-backed naming scheme).
+  `kubernetes.io/docs/concepts/services-networking/dns-pod-service/`
+- **RFC 791 (IP) and RFC 9293 (TCP).** The foundational protocols behind every
+  (IP, port) conversation in a cluster. `rfc-editor.org`
+
+Next chapter: Services, controllers, and the whole self-healing story all assume
+one thing — a single, trustworthy place that records what the cluster *should*
+look like and what it *currently* looks like. We finally open that store: etcd,
+the cluster's memory.
+
+</Section>
+
+</ChapterReader>

@@ -1,0 +1,212 @@
+---
+title: "When It Breaks"
+chapterNumber: 22
+summary: "Most incidents are diagnosed with four commands and the discipline to read what the cluster already told you. This chapter is a practical playbook: get, describe, logs, events — and a field guide to the Pod states (CrashLoopBackOff, ImagePullBackOff, Pending, OOMKilled) that each point at a different layer of the problem."
+readingTime: "22 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { troubleshootingTerminal } from '@/data/production';
+
+<ChapterReader chapterId="22-when-it-breaks">
+
+<Section
+  id="the-playbook"
+  title="Four commands"
+  brief={{
+    problem: "Under incident pressure people thrash — restarting things at random — instead of letting the cluster tell them what's wrong.",
+    mechanism: "A fixed order works almost every time: get, then describe, then logs, then events. Each zooms in one level.",
+    takeaway: "Troubleshooting is reading, not guessing. The cluster is already reporting the cause; follow the commands in order.",
+  }}
+  quiz={{
+    question: "What is the value of following a fixed get → describe → logs → events order?",
+    options: [
+      { text: "It restarts the Pod faster." },
+      { text: "Each step zooms in one level, so you read the cluster's own account instead of guessing.", correct: true },
+      { text: "It avoids using the API server." },
+    ],
+  }}
+>
+
+Here's the secret about Kubernetes troubleshooting: the cluster almost always
+*already knows* what's wrong and is telling you. The skill isn't arcane
+knowledge; it's the discipline to read the report in order instead of thrashing.
+Four commands handle the overwhelming majority of incidents:
+
+1. **`kubectl get pods`** — the wide shot. The `STATUS` and `RESTARTS` columns
+   usually *name* the problem before you do anything else.
+2. **`kubectl describe pod <name>`** — the detail view. Scroll to the bottom: the
+   **Events** list is a timeline of what the scheduler, kubelet, and controllers
+   tried, and why it failed.
+3. **`kubectl logs <name>`** (add **`--previous`** for a container that already
+   crashed) — the application's own account of its death.
+4. **`kubectl get events --sort-by=.lastTimestamp`** — cluster-level events, for
+   when the problem is bigger than one Pod (a node going `NotReady`, a failing
+   image pull across the fleet).
+
+Each step zooms in one level: from "which Pod is unhappy" to "what the platform
+did about it" to "what the app said as it fell over." Resist the urge to skip to
+step three and start editing code. The earlier steps usually tell you *which
+layer* the problem lives in, which is half the answer.
+
+</Section>
+
+<Section
+  id="reading-states"
+  title="Reading the Pod states"
+  brief={{
+    problem: "A Pod's STATUS isn't a vague 'broken' — each named state points at a specific layer: the app, the image, the scheduler, or memory.",
+    mechanism: "Learn the four common failure states and the layer each implicates, so STATUS routes your investigation.",
+    takeaway: "The state tells you where to look; CrashLoopBackOff ≠ ImagePullBackOff ≠ Pending ≠ OOMKilled.",
+  }}
+  quiz={{
+    question: "A Pod is stuck in Pending and describe says '0/3 nodes available: insufficient cpu.' What does that indicate?",
+    options: [
+      { text: "The container image name is wrong." },
+      { text: "A scheduling problem — no node has enough free CPU, so lower requests or add a node.", correct: true },
+      { text: "The app ran out of memory and was killed." },
+    ],
+  }}
+>
+
+A Pod's `STATUS` is not a generic "broken." Each common failure state implicates a
+specific **layer**, and knowing the map turns a vague alert into a directed
+search.
+
+- **`CrashLoopBackOff`** — the container starts, then exits, repeatedly, so the
+  kubelet waits longer between each restart (the "back-off"). The fault is *inside
+  the app*: an unhandled exception, a failed migration, a missing env var. Next
+  stop: `logs --previous`.
+- **`ImagePullBackOff`** / `ErrImagePull` — the kubelet can't *fetch* the image.
+  Wrong tag, typo'd registry, or a missing pull secret. The app never ran at all;
+  this is a packaging/registry problem, not a code one.
+- **`Pending`** (unschedulable) — the **scheduler** can't place the Pod. `describe`
+  spells out why: `insufficient cpu/memory`, or an unsatisfiable nodeSelector,
+  affinity, or taint. Fix by lowering requests, adding capacity, or relaxing the
+  constraint — *not* by touching the app.
+- **`OOMKilled`** — the container exceeded its memory **limit** and the kernel's
+  out-of-memory killer terminated it. Either the limit is too low or the app is
+  leaking; raise the limit or fix the leak.
+
+<Callout type="note">
+Notice how the state alone narrows the layer: app logic (`CrashLoopBackOff`),
+packaging (`ImagePullBackOff`), scheduling (`Pending`), or resources
+(`OOMKilled`). You've eliminated three-quarters of the search space before reading
+a single log line.
+</Callout>
+
+</Section>
+
+<Section
+  id="walkthrough"
+  title="Walking a real failure"
+  brief={{
+    problem: "Knowing the states in the abstract is not the same as running the playbook on a Pod that's actually down.",
+    mechanism: "Take one Pod in CrashLoopBackOff through get → describe → logs --previous and watch the root cause surface.",
+    takeaway: "The state routes you to the layer; the previous logs hand you the exact cause.",
+  }}
+  quiz={{
+    question: "A Pod shows CrashLoopBackOff. Which command most directly reveals why it crashed?",
+    options: [
+      { text: "kubectl delete node, to reset the cluster." },
+      { text: "kubectl logs <pod> --previous, to read the crashed container's final output.", correct: true },
+      { text: "kubectl scale deploy to 0 and move on." },
+    ],
+  }}
+>
+
+Let's run the playbook for real. Below, a Pod named `web-1` is misbehaving. Start
+wide with `kubectl get pods` and read the `STATUS`. Then `kubectl describe pod
+web-1` to confirm the state and read the Events timeline. Finally, because the
+container has already crashed, `kubectl logs web-1 --previous` to read what it
+said on the way down. Run them in that order:
+
+<Figure number="22.1" caption="The playbook on one Pod: get names the state, describe shows the back-off events, and the previous container's logs reveal the actual cause.">
+  <KubectlTerminal client:visible id="ch22-term" commands={troubleshootingTerminal} />
+</Figure>
+
+Watch how the picture sharpens. `get pods` tells you `web-1` is in
+`CrashLoopBackOff` with five restarts — so the fault is *in the app*, and the
+kubelet is dutifully backing off. `describe` confirms it: the container's last
+state is `Terminated` with `Exit Code: 1`, and the Events show
+`Back-off restarting failed container`. That's the symptom, not the cause. The
+cause is in the **previous** container's logs:
+
+```text
+FATAL config: required env DATABASE_URL is not set
+panic: missing DATABASE_URL
+```
+
+There it is — a missing environment variable, almost certainly an absent or
+mis-keyed ConfigMap/Secret reference in the Pod spec. You would *never* have seen
+that from `get pods` alone; the state told you *which layer*, and `--previous`
+handed you the *exact* line. That is the entire method: let the state route you,
+then read the evidence the cluster already wrote down.
+
+</Section>
+
+<Section
+  id="bigger-than-one-pod"
+  title="When it's bigger than one Pod"
+  brief={{
+    problem: "Sometimes every Pod on a node is unhappy at once, or a whole rollout stalls — a per-Pod view misses a problem one level up.",
+    mechanism: "Widen the lens with cluster events and node status: get events sorted by time, and get nodes to spot a NotReady machine.",
+    takeaway: "If many Pods fail together, suspect the layer beneath them — the node, the image registry, or the control plane.",
+  }}
+  quiz={{
+    question: "Several Pods across the cluster suddenly go Pending or ContainerCreating at once. What should you check first?",
+    options: [
+      { text: "Each Pod's application logs, one by one." },
+      { text: "Cluster-level signals — kubectl get nodes for a NotReady node and kubectl get events for a shared cause.", correct: true },
+      { text: "Rebuild and redeploy every image immediately." },
+    ],
+  }}
+>
+
+The four-command playbook assumes one sick Pod. Sometimes the pattern is
+different: *many* Pods fail together, or a whole rollout stalls. When failure is
+correlated, the cause usually lives one layer *below* the Pods, and a per-Pod
+view will have you chasing symptoms.
+
+Widen the lens. **`kubectl get nodes`** shows whether a machine has gone
+`NotReady` — a dead kubelet or a failed node will take every Pod on it down with
+it, producing a cluster-wide flurry of restarts and reschedules that looks like
+chaos until you see the one bad node. **`kubectl get events --sort-by=.lastTimestamp -A`**
+gives you the whole cluster's recent history in time order; a shared root cause —
+a registry outage causing `ImagePullBackOff` everywhere, a `FailedScheduling`
+storm because the cluster is genuinely full — jumps out as a repeated message.
+
+<Callout type="tip">
+Correlation is the clue. *One* Pod in `CrashLoopBackOff` is an app bug. *Twenty*
+Pods across *five* nodes failing in the same minute is almost never twenty app
+bugs — it's one shared dependency: a node, the registry, DNS, or the control
+plane. Match the breadth of your investigation to the breadth of the failure.
+</Callout>
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+These references turn the playbook above into a habit.
+
+- **Kubernetes Documentation — *Debug Running Pods* and *Debug Pods*.** The
+  official walkthroughs for `describe`, `logs`, `events`, and the common Pod
+  states. `kubernetes.io/docs/tasks/debug/debug-application/`
+- **Kubernetes Documentation — *Pod Lifecycle*.** What each phase and container
+  state (`Waiting`, `Terminated`, reasons like `CrashLoopBackOff`) actually means.
+- **`kubectl` Reference — *`kubectl describe` / `kubectl logs`*.** The flags that
+  matter under pressure, including `--previous` and `--since`.
+
+Next chapter: you've scaled it, watched it, shipped it, and debugged it. *Capstone:
+Ship to Production* ties the whole book into one checklist you can actually follow
+to put an app live — and then sends you off to go build something.
+
+</Section>
+
+</ChapterReader>

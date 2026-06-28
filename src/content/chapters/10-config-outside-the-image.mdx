@@ -1,0 +1,226 @@
+---
+title: "Config That Doesn't Live in the Image"
+chapterNumber: 10
+summary: "The same image has to run in dev, staging, and prod with different database URLs and credentials. Bake those into the image and you rebuild for every environment — and ship secrets in a layer anyone can crack open. Kubernetes pulls config and secrets out of the image into objects you inject at runtime."
+readingTime: "22 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { configTerminal } from '@/data/core';
+
+<ChapterReader chapterId="10-config-outside-the-image">
+
+<Section
+  id="baked-in-trap"
+  title="The baked-in-config trap"
+  brief={{
+    problem: "Your one image must run in dev, staging, and prod with different URLs, flags, and credentials. If config lives in the image, each environment needs its own build.",
+    mechanism: "An image is a build artifact; configuration is environment-specific. Mixing them forces a rebuild per environment and leaks secrets into image layers.",
+    takeaway: "Config belongs outside the image so one tested artifact runs unchanged everywhere.",
+  }}
+  quiz={{
+    question: "Why is baking environment configuration into your container image a problem?",
+    options: [
+      { text: "Images can't store text files." },
+      { text: "It forces a separate rebuild per environment and bakes secrets into a layer anyone with the image can read.", correct: true },
+      { text: "Kubernetes refuses to run images that contain config." },
+    ],
+  }}
+>
+
+You have one container image for your app. It needs to run in three places — your
+laptop, a staging cluster, and production — and in each place it needs *different*
+settings: a different database URL, a different log level, different API
+credentials. Where do those settings go?
+
+The tempting answer is "inside the image." Drop a `config.prod.json` into the
+build, or hard-code the database host. It works on day one and rots immediately.
+An **image is a build artifact** — an immutable, content-addressed stack of
+layers you build once and promote. **Configuration is environment-specific** — it
+changes per place, sometimes per deploy. The instant you mix the two, you've
+broken a core promise: that the artifact you tested in staging is byte-for-byte
+the one running in prod.
+
+Concretely, baking config in costs you:
+
+- **A rebuild per environment.** Want to change the prod database host? Rebuild
+  and re-push the image. Now "staging" and "prod" are *different images*, and the
+  whole point of a tested artifact evaporates.
+- **Leaked secrets.** Put a password in the image and it's in a layer. Anyone who
+  can pull the image — your whole CI system, every developer, the registry — can
+  unpack that layer and read it. Image layers are not a vault.
+
+The fix is to keep the image *pure* — just code and dependencies — and inject the
+environment-specific bits at runtime. Kubernetes gives you two objects for exactly
+this, split by one question: is the data sensitive?
+
+</Section>
+
+<Section
+  id="configmap"
+  title="ConfigMap: the non-sensitive half"
+  brief={{
+    problem: "You need to feed non-secret settings — log levels, feature flags, hostnames, whole config files — into a Pod without rebuilding the image.",
+    mechanism: "A ConfigMap is a named bundle of key-value data (or whole files) stored in the cluster, created independently of any image and referenced by Pods.",
+    takeaway: "A ConfigMap externalizes non-sensitive configuration into a cluster object you can change without touching the image.",
+  }}
+  quiz={{
+    question: "What kind of data is a ConfigMap meant to hold?",
+    options: [
+      { text: "Passwords and TLS private keys." },
+      { text: "Non-sensitive configuration — log levels, feature flags, hostnames, config files.", correct: true },
+      { text: "The container image layers themselves." },
+    ],
+  }}
+>
+
+The first object is the **ConfigMap**, and it holds the *non-sensitive* half of
+your configuration: log levels, feature flags, upstream hostnames, timeouts, even
+entire config files. It's just a named bundle of key-value data living in the
+cluster, created and edited independently of any image.
+
+You make one with a manifest or a command like `kubectl create configmap
+app-config --from-literal=LOG_LEVEL=info`, and from then on it's a first-class
+object your Pods can reference. Crucially, the *image* knows nothing about it. The
+same `web:v1` image runs in staging with a staging ConfigMap and in prod with a
+prod ConfigMap — one artifact, two configurations, zero rebuilds. Inspect one:
+
+<Figure number="10.1" caption="A ConfigMap is just named data in the cluster. `kubectl describe configmap app-config` shows the keys — a log level, a feature flag, an upstream URL — that a Pod will read at runtime.">
+  <KubectlTerminal client:visible id="ch10-term" commands={configTerminal} />
+</Figure>
+
+Notice what this buys you organizationally. Configuration becomes a thing you can
+review, diff, and roll back on its own, separate from code. A platform team can
+own the prod ConfigMap while developers own the image. And because it's a normal
+Kubernetes object, it goes through the same API server, the same RBAC, the same
+audit trail as everything else. The settings stopped being a property of the
+build and became a property of the *deployment* — which is exactly where
+environment-specific things belong.
+
+</Section>
+
+<Section
+  id="secret"
+  title="Secret: the sensitive half (and the base64 trap)"
+  brief={{
+    problem: "Passwords and tokens need the same externalization as config, but with tighter handling — and people wrongly assume Secrets are encrypted.",
+    mechanism: "A Secret is structurally like a ConfigMap but for sensitive data. Its values are base64-encoded — encoding, not encryption — unless you enable encryption at rest.",
+    cost: "base64 is trivially reversible; real protection requires encryption-at-rest in etcd plus tight RBAC.",
+    takeaway: "Secrets externalize sensitive data, but base64 is not security — you must turn on encryption at rest and lock down access.",
+  }}
+  quiz={{
+    question: "A Secret's values are base64-encoded. What does that mean for security?",
+    options: [
+      { text: "They're encrypted and safe by default." },
+      { text: "Almost nothing — base64 is reversible encoding, not encryption; real protection needs encryption-at-rest and RBAC.", correct: true },
+      { text: "They can never be read back, even by your app." },
+    ],
+  }}
+>
+
+The second object is the **Secret**, for the *sensitive* half: passwords, API
+tokens, TLS private keys. Structurally it's almost identical to a ConfigMap — a
+named bundle of key-value data — but Kubernetes treats it with more care, and you
+must understand exactly *how much* more, because the most common misconception in
+this whole area lives here.
+
+**A Secret is base64-encoded, not encrypted.** Look back at the terminal in the
+previous section: `username: YWRtaW4=` is just `base64("admin")`. Anyone who can
+read the Secret object can decode it in one command. Base64 is there so binary
+data (like a certificate) survives being stored as text — it is *encoding*, a
+reversible transformation with no key, not *security*. Treating a Secret as
+inherently safe because "it's encoded" is how credentials leak.
+
+<Callout type="warning">
+By default, Secret data sits in etcd essentially in the clear. To get real
+protection you must (1) enable **encryption at rest** so etcd encrypts Secret
+values on disk, and (2) lock down **RBAC** so only the workloads and people that
+need a Secret can read it. Many teams also pull secrets from an external manager
+(Vault, cloud KMS) rather than storing long-lived ones in the cluster at all.
+</Callout>
+
+What Kubernetes *does* do for Secrets beyond ConfigMaps: it can keep them in
+memory (tmpfs) rather than on a node's disk when mounted, it avoids printing their
+values in logs and `describe` output, and it lets you scope access tightly. Use a
+Secret for anything sensitive — but know that the object is a *container* for
+secret data, and the actual confidentiality comes from the controls you put around
+it.
+
+</Section>
+
+<Section
+  id="env-vs-files"
+  title="Two ways in: environment variables vs. files"
+  brief={{
+    problem: "A ConfigMap or Secret in the cluster is useless until its values reach the process inside the container. How they're injected changes how your app reads them and whether updates take effect live.",
+    mechanism: "Inject either as environment variables (read once at startup) or as mounted files in a volume (each key a file, can update live).",
+    takeaway: "Env vars are simple but frozen at start; mounted files suit config files and can refresh without a restart.",
+  }}
+  quiz={{
+    question: "You mount a ConfigMap as files and later edit the ConfigMap. What's the advantage over injecting it as env vars?",
+    options: [
+      { text: "Files load faster than environment variables." },
+      { text: "Mounted files can update in place without restarting the Pod, whereas env vars are fixed at container startup.", correct: true },
+      { text: "Only files can hold non-sensitive data." },
+    ],
+  }}
+>
+
+Having a ConfigMap or Secret in the cluster does nothing until its values reach
+the process inside the container. There are two ways to inject them, and the
+choice has real consequences.
+
+**As environment variables.** You map each key to an `env` entry, and the process
+reads it at startup like any environment variable — `process.env.LOG_LEVEL`,
+`os.environ["DB_PASSWORD"]`. Simple and universal. The catch: environment
+variables are read *once*, when the container starts. Change the underlying
+ConfigMap and the running process won't see it until it restarts. Env vars are
+also easier to leak — they show up in child processes, crash dumps, and careless
+logging — which is why they're a weaker choice for secrets.
+
+**As mounted files.** You mount the ConfigMap or Secret as a volume, and each key
+becomes a file in a directory — `/etc/config/LOG_LEVEL` containing `info`. This
+fits apps that already read a config file, and it has a quiet superpower: when you
+update the ConfigMap, the mounted files update in place (after a short sync
+delay), so a process that re-reads its config can pick up changes *without a
+restart*. For Secrets, file mounts are generally preferred over env vars — files
+are less likely to leak into logs and child processes.
+
+A rough rule: reach for **env vars** for a handful of simple scalar settings, and
+for **file mounts** when you have a real config file, when values might change
+under a running Pod, or when the data is a secret you want to keep out of the
+environment. Either way, the win is the same one from the top of the chapter — the
+image stays pure, and the configuration arrives at runtime.
+
+That covers a Pod's *settings*. But settings are small and disposable. What about
+real **data** — the rows a database must not lose when its Pod is rescheduled to
+another machine? That's a harder problem, and it's next.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Externalized configuration is one of the twelve-factor principles Kubernetes
+makes concrete.
+
+- **Kubernetes Documentation — *ConfigMaps* and *Secrets*.** The reference for
+  creating them and the env-var vs. volume injection methods.
+  `kubernetes.io/docs/concepts/configuration/`
+- **Kubernetes Documentation — *Encrypting Confidential Data at Rest*.** The
+  steps that turn a Secret from base64 into actually-protected data.
+- **Wiggins, *The Twelve-Factor App* — factor III, *Config*.** The principle that
+  config belongs in the environment, not the build.
+
+Next chapter: configuration is small and replaceable, but a database's data is
+not. We look at how Kubernetes gives Pods storage that survives the death and
+rescheduling Pods are designed to endure.
+
+</Section>
+
+</ChapterReader>

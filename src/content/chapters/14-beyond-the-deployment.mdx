@@ -1,0 +1,222 @@
+---
+title: "Beyond the Deployment"
+chapterNumber: 14
+summary: "A Deployment treats its pods as interchangeable cattle — perfect for stateless web servers, wrong for a database, a per-node agent, or a one-off batch job. This chapter runs into each case where 'identical, replaceable pods' breaks, and meets the controller built for it: StatefulSet, DaemonSet, Job, and CronJob."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { workloadsTerminal } from '@/data/advanced';
+
+<ChapterReader chapterId="14-beyond-the-deployment">
+
+<Section
+  id="interchangeable"
+  title="When 'interchangeable' breaks"
+  brief={{
+    problem: "A Deployment assumes its pods are identical and replaceable — any one can be killed and recreated anywhere with no loss.",
+    mechanism: "That assumption holds for stateless services but fails for anything with identity, per-node duties, or a finite end.",
+    takeaway: "The right controller is a statement about a workload's lifecycle; pick the wrong one and you fight the platform.",
+  }}
+  quiz={{
+    question: "What assumption does a Deployment make about its pods?",
+    options: [
+      { text: "That each pod has a permanent name and its own disk." },
+      { text: "That the pods are interchangeable — any one can be replaced by an identical copy anywhere.", correct: true },
+      { text: "That there is exactly one pod per node." },
+    ],
+  }}
+>
+
+A Deployment is a beautiful tool, and you've leaned on it because for stateless web
+services it's exactly right. Its whole model is that the pods are **cattle, not
+pets**: three identical copies, and it does not matter *which* three. Kill one and
+the Deployment makes another, on whatever node has room. The replacement is
+indistinguishable from what it replaced. No identity, no attachment, no order.
+
+That assumption is load-bearing, and it quietly breaks the moment a workload has any
+of three properties:
+
+- **Identity.** A database replica isn't interchangeable. The primary and the
+  followers play different roles; each owns a specific slice of data on a specific
+  disk. "Kill any one and make an identical copy somewhere" is a way to corrupt a
+  database.
+- **Per-node duty.** A log collector or metrics agent needs to run on *every*
+  node, because its whole job is to watch the node it sits on. "Three copies
+  somewhere" is meaningless — you want exactly one copy *per machine*.
+- **A finite end.** A database migration or a nightly report runs, finishes, and
+  should *stop*. A Deployment would dutifully restart it forever, treating
+  "the program exited successfully" as a crash to heal.
+
+Kubernetes doesn't bolt these onto the Deployment. It gives each its own
+controller — each running the same observe-compare-act loop, but with a different
+definition of what "correct" means.
+
+</Section>
+
+<Section
+  id="statefulset"
+  title="StatefulSet: identity and storage that stick"
+  brief={{
+    problem: "Databases and clustered stores need each pod to keep a stable name and its own persistent disk across restarts and rescheduling.",
+    mechanism: "A StatefulSet gives pods ordered, stable names (web-0, web-1) and a per-pod PersistentVolumeClaim that follows each pod, rolling them out in order.",
+    cost: "Ordering and identity make scaling and rollout slower and more careful than a Deployment's free-for-all.",
+    takeaway: "Use a StatefulSet when a pod's name and disk are part of its correctness, not incidental.",
+  }}
+  quiz={{
+    question: "Why can't you safely run a clustered database as a plain Deployment?",
+    options: [
+      { text: "Deployments can't pull database images." },
+      { text: "Its pods need stable identities and their own persistent disks, which a Deployment's interchangeable pods don't provide.", correct: true },
+      { text: "Deployments are limited to one replica." },
+    ],
+  }}
+>
+
+A **StatefulSet** is for workloads where the pods are emphatically *not*
+interchangeable: databases, message brokers, clustered key-value stores. It changes
+three guarantees relative to a Deployment.
+
+**Stable, ordered names.** Instead of random hashes like `web-7d9f`, a StatefulSet
+names its pods `web-0`, `web-1`, `web-2`. Those names are stable across restarts and
+rescheduling. `web-0` is always `web-0`, so other pods — and clients doing leader
+election — can address it reliably.
+
+**Stable storage.** Each pod gets its *own* PersistentVolumeClaim that travels with
+it. When `web-1` is rescheduled to another node, it reattaches to *its* disk, not a
+fresh blank one. The data is bound to the identity, which is exactly what a stateful
+system needs.
+
+**Ordered operation.** Pods come up in order — `web-0` becomes ready before `web-1`
+starts — and scale down in reverse. Clustered systems that must initialize a primary
+before its replicas depend on this.
+
+Look at how the cluster reports a StatefulSet. The ordered, named pods are visible
+in the output in a way a Deployment's never are:
+
+<Figure number="14.1" caption="A StatefulSet's pods carry ordered, stable identities — web-0, web-1, web-2 — each bound to its own volume. Try the commands.">
+  <KubectlTerminal client:visible id="ch14-term" commands={workloadsTerminal} />
+</Figure>
+
+<Callout type="warning">
+A StatefulSet's guarantees cost you speed and simplicity. Rollouts are sequential,
+not all-at-once, and scaling is deliberate. That's the price of identity — pay it
+only when a pod's name and disk actually matter.
+</Callout>
+
+</Section>
+
+<Section
+  id="daemonset"
+  title="DaemonSet: one per node, automatically"
+  brief={{
+    problem: "Node-level agents (log collectors, monitoring, CNI plugins) must run on every node, including nodes that join later.",
+    mechanism: "A DaemonSet ensures exactly one pod per node (or per matching node), scheduling onto new nodes as they appear and cleaning up when they leave.",
+    takeaway: "With a DaemonSet you don't pick a replica count — the node count is the replica count.",
+  }}
+  quiz={{
+    question: "You need a metrics agent on every node, including ones added next week. Which controller?",
+    options: [
+      { text: "A Deployment with replicas set to the current node count." },
+      { text: "A DaemonSet, which runs one pod per node and follows nodes as they join and leave.", correct: true },
+      { text: "A CronJob that runs every minute." },
+    ],
+  }}
+>
+
+Some software's job *is* the machine it runs on: a log collector reading that node's
+logs, a metrics exporter measuring that node's CPU, the CNI plugin wiring that node's
+pod network. For these, "run three copies somewhere" is the wrong question entirely.
+You want **one copy on every node**.
+
+A **DaemonSet** delivers exactly that. It ensures one pod runs on each node (or each
+node matching a label selector). The part that makes it more than a fixed list: it's
+a control loop over the *set of nodes*. Add a node to the cluster and the DaemonSet
+notices the gap and schedules its pod there automatically. Drain a node and its
+DaemonSet pod is cleaned up. You never edit a replica count — the node count *is* the
+count, and it tracks the cluster as it grows and shrinks.
+
+This is why nearly every cluster add-on you'll meet — `fluentd` for logs,
+`node-exporter` for metrics, the CNI agent for networking — ships as a DaemonSet.
+Each needs a presence on every machine, and a DaemonSet makes "every machine" a
+self-maintaining promise rather than a list someone has to update.
+
+</Section>
+
+<Section
+  id="job-cronjob"
+  title="Job and CronJob: work that finishes"
+  brief={{
+    problem: "Batch work — a migration, an export, a nightly report — should run, succeed, and stop, not be restarted forever.",
+    mechanism: "A Job runs pods until a target number complete successfully; a CronJob creates a Job on a schedule.",
+    takeaway: "These controllers treat a clean exit as success, not as a failure to heal — the opposite of a Deployment.",
+  }}
+  quiz={{
+    question: "What distinguishes a Job from a Deployment?",
+    options: [
+      { text: "A Job runs to successful completion and then stops, rather than keeping pods running forever.", correct: true },
+      { text: "A Job can only run on the control plane." },
+      { text: "A Job cannot mount volumes." },
+    ],
+  }}
+>
+
+The last break with the Deployment model is workloads that are supposed to *end*.
+Run a database migration as a Deployment and you get a nightmare: the migration
+finishes, the process exits cleanly, and the Deployment — which reads "process
+exited" as "pod died" — restarts it, running your migration again and again.
+
+A **Job** has the opposite definition of correct. It runs one or more pods until a
+specified number **complete successfully**, and then it's *done*. A clean exit is
+the goal, not a failure. Use a Job for anything finite: a schema migration, a data
+export, a batch computation, a one-time backfill. If a Job's pod fails partway, the
+Job retries it (up to a limit) — but once the work succeeds, it stops, exactly as
+the terminal above shows with `COMPLETIONS 1/1`.
+
+A **CronJob** wraps a Job with a schedule. Give it a cron expression and it creates
+a fresh Job each time the clock matches:
+
+```yaml
+kind: CronJob
+spec:
+  schedule: "0 2 * * *"   # 02:00 every day
+  jobTemplate: { ... }     # the Job to run each time
+```
+
+That's the natural home for recurring maintenance: nightly backups, hourly report
+generation, periodic cleanup. The CronJob fires the Job; the Job runs to completion;
+the cycle repeats on schedule.
+
+So the choosing rule is really a question about lifecycle. Long-running and
+interchangeable → **Deployment**. Long-running with identity and storage →
+**StatefulSet**. One per node → **DaemonSet**. Finite → **Job**. Finite on a
+schedule → **CronJob**. Pick the controller whose definition of "correct" matches
+what your workload actually is.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The official workloads documentation is organized exactly around these lifecycle
+distinctions, with the guarantees of each controller spelled out precisely.
+
+- **Kubernetes Documentation — *Workloads* → *StatefulSets*, *DaemonSet*, *Jobs*,
+  *CronJob*.** The authoritative reference for what each controller guarantees and
+  how to configure it. `kubernetes.io/docs/concepts/workloads/`
+- **Kubernetes Documentation — *StatefulSet Basics* tutorial.** A hands-on walk
+  through stable identities and per-pod storage.
+  `kubernetes.io/docs/tutorials/stateful-application/`
+
+Next chapter: these workloads need to talk — to each other and to the outside
+world. We go deeper into the network, from the flat pod network the CNI builds, up
+to L7 routing with Ingress, and back down to locking it all with NetworkPolicy.
+
+</Section>
+
+</ChapterReader>

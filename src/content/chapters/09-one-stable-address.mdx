@@ -1,0 +1,262 @@
+---
+title: "One Stable Address Over Many Pods"
+chapterNumber: 9
+summary: "Your Deployment keeps three Pods alive — but every time one is replaced it gets a brand-new IP. Hard-code an address and it's wrong within the hour. The fix is a stable name and virtual IP that floats over whichever Pods happen to be alive right now: the Service."
+readingTime: "24 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { serviceTopologyNodes, serviceTerminal } from '@/data/core';
+
+<ChapterReader chapterId="09-one-stable-address">
+
+<Section
+  id="moving-target"
+  title="The moving-target problem"
+  brief={{
+    problem: "The Deployment from Chapter 8 keeps replacing Pods, and each new Pod gets a new IP. Anything that hard-codes a Pod address is wrong the moment a Pod is rescheduled.",
+    mechanism: "Introduce an indirection: a stable identity that always points at the current set of healthy Pods, so callers never chase IPs.",
+    takeaway: "Self-healing Pods are a moving target; you need a fixed thing to aim at.",
+  }}
+  quiz={{
+    question: "Why can't one Pod just connect to another Pod by its IP address?",
+    options: [
+      { text: "Pods aren't allowed to use IP addresses." },
+      { text: "Pod IPs are ephemeral — a replaced Pod gets a new address — so a hard-coded IP goes stale constantly.", correct: true },
+      { text: "IP addresses are too slow compared to names." },
+    ],
+  }}
+>
+
+The last chapter handed you a beautiful thing and a hidden problem in the same
+breath. The beautiful thing: a Deployment that keeps three healthy Pods alive
+forever, replacing any that die. The hidden problem: *each replacement Pod gets a
+brand-new IP address.*
+
+Pod IPs are ephemeral by nature. A Pod crashes, the ReplicaSet makes a new one,
+and that new Pod gets whatever address the network hands out — not the old one. A
+rolling update replaces all three Pods, so all three IPs change. Scale up and new
+IPs appear; scale down and some vanish. The very self-healing you wanted means the
+set of live addresses is *always shifting*.
+
+Now imagine your frontend needs to call your backend. If the frontend hard-codes
+`10.1.2.7`, that address is correct until the first time the backend Pod is
+replaced — minutes, maybe. Then the frontend is calling a dead IP, or worse, an
+IP that now belongs to something else. You cannot build anything on a foundation
+that renumbers itself.
+
+The shape of the fix is familiar from the whole book: add an **indirection**. Put
+a single stable thing between callers and the churning Pods — something that
+always knows the current set of healthy addresses and presents one unchanging
+identity to the world. That thing is the **Service**.
+
+</Section>
+
+<Section
+  id="what-service-is"
+  title="What a Service actually is"
+  brief={{
+    problem: "Callers need one address that never changes, even though the Pods behind it change constantly.",
+    mechanism: "A Service is a stable virtual IP (ClusterIP) and DNS name that selects Pods by label; the cluster keeps the backing IP list current automatically.",
+    takeaway: "A Service is a fixed front (name + VIP) over a label-selected, ever-changing back (Pods).",
+  }}
+  quiz={{
+    question: "What does a Service use to decide which Pods sit behind it?",
+    options: [
+      { text: "A fixed list of Pod IP addresses you maintain." },
+      { text: "A label selector — every Pod whose labels match is automatically a backend, and the list updates as Pods come and go.", correct: true },
+      { text: "The node each Pod runs on." },
+    ],
+  }}
+>
+
+A **Service** is a stable identity laid over a moving set of Pods. It has two
+parts that never change for its whole life: a **virtual IP** (the ClusterIP) and a
+**DNS name**. And it has one part that changes constantly: the set of Pods it
+points at, chosen — naturally — by a **label selector**.
+
+You give the Service a selector like `app: web`. From then on, *any* Pod whose
+labels match is a backend for that Service, and Kubernetes keeps the list current
+automatically. A Pod dies, its IP drops out; a new Pod is born with the matching
+label, its IP joins. The Service's own VIP and name don't budge through any of it.
+Click through the relationship:
+
+<Figure number="9.1" caption="A Service is a fixed front over a moving back. The VIP and DNS name of `web` never change; the three Pod IPs behind it are replaced freely as the Deployment heals and scales.">
+  <Diagram client:visible id="svc-topology" title="One Service, many Pods" nodes={serviceTopologyNodes} />
+</Figure>
+
+Callers talk to the stable VIP (or, in practice, the name), and the cluster
+load-balances each new connection across the currently-healthy backing Pods. The
+frontend connects to `web` and never learns or cares which Pod answered, or that
+the Pod answering this minute is different from the one that answered last minute.
+
+This is the same loose coupling you saw with ReplicaSets, reused for a new
+purpose. The ReplicaSet uses a label selector to decide which Pods to *keep
+alive*; the Service uses one to decide which Pods to *send traffic to*. Labels are
+the universal glue, and "a stable thing pointing at a label-selected set" is a
+pattern you'll now see everywhere.
+
+</Section>
+
+<Section
+  id="endpoints-kubeproxy"
+  title="Endpoints and kube-proxy: making the VIP real"
+  brief={{
+    problem: "A virtual IP is just a number — no machine owns it. Something has to actually route packets aimed at it to a real Pod.",
+    mechanism: "The cluster tracks matching Pod IPs as the Service's Endpoints; kube-proxy on each node programs iptables/IPVS to rewrite VIP traffic to one of them.",
+    takeaway: "Endpoints are the live list of backing IPs; kube-proxy is the plumbing that turns the stable VIP into delivered packets.",
+  }}
+  quiz={{
+    question: "A ClusterIP is virtual — no node 'has' it. So how does traffic to it reach a real Pod?",
+    options: [
+      { text: "The API server forwards each packet to a Pod." },
+      { text: "kube-proxy on each node programs iptables/IPVS rules that rewrite VIP-bound traffic to one of the Service's current Endpoint IPs.", correct: true },
+      { text: "etcd stores the packets until a Pod reads them." },
+    ],
+  }}
+>
+
+A virtual IP is, physically, a fiction — no network card answers to it. Two
+mechanisms turn that fiction into delivered packets.
+
+First, the **Endpoints** (today often an **EndpointSlice**). This is the live
+list of IP:port pairs of the Pods currently matching the Service's selector. A
+controller maintains it: whenever a matching Pod becomes ready it's added, and
+whenever one dies or fails its readiness check it's removed. The Endpoints object
+is the concrete, always-current answer to "who is behind this Service right now?"
+
+Second, **kube-proxy**, the node component you met in Chapter 6. It runs on every
+node and watches Services and their Endpoints. For each Service it programs the
+node's kernel networking — iptables rules, or IPVS for larger clusters — so that
+any packet sent to the Service's ClusterIP is transparently rewritten to the
+address of one of the current Endpoint Pods, spreading connections across them.
+No userspace proxy sits in the data path in the common case; it's the kernel
+doing the rewrite, which is why it's fast.
+
+<Figure number="9.2" caption="`kubectl get svc` shows the Service's stable ClusterIP; `kubectl get endpoints web` shows the live Pod IPs behind it — the list kube-proxy turns into routing rules.">
+  <KubectlTerminal client:visible id="ch9-term" commands={serviceTerminal} />
+</Figure>
+
+So the full picture: the selector defines membership, the Endpoints list makes
+membership concrete, and kube-proxy makes the concrete list routable. Three small
+pieces, and together they let a fixed address float over a churning fleet.
+
+</Section>
+
+<Section
+  id="service-types"
+  title="ClusterIP, NodePort, LoadBalancer"
+  brief={{
+    problem: "A stable in-cluster VIP solves Pod-to-Pod calls, but sometimes traffic has to reach your app from outside the cluster entirely.",
+    mechanism: "Three Service types layer on each other: ClusterIP (internal), NodePort (a port on every node), LoadBalancer (a cloud LB in front of that).",
+    takeaway: "Each Service type builds on the one below it, trading internal-only reach for progressively more external exposure.",
+  }}
+  quiz={{
+    question: "Which Service type would you use to expose an app to the public internet on a cloud cluster?",
+    options: [
+      { text: "ClusterIP — it's reachable from anywhere." },
+      { text: "LoadBalancer — it provisions a cloud load balancer with a public IP in front of the Service.", correct: true },
+      { text: "NodePort is the only way; LoadBalancer is internal-only." },
+    ],
+  }}
+>
+
+The Service we've described so far is internal: its ClusterIP is reachable only
+from inside the cluster. That's perfect for one microservice calling another, and
+it's the **default** type. But sometimes traffic has to come from *outside*, and
+Kubernetes handles that by stacking two more types on top of ClusterIP — each one
+includes the layer beneath it.
+
+- **ClusterIP** (default) — a stable VIP reachable only within the cluster. Ideal
+  for service-to-service traffic, like a frontend calling a backend. Most
+  Services in a real cluster are this type.
+- **NodePort** — everything ClusterIP does, *plus* it opens the same fixed port
+  (in the 30000–32767 range) on **every node**. Hit any node's IP on that port and
+  you reach the Service. It's the crude building block for external access —
+  handy for a quick test, rarely the final answer in production because you're
+  exposing raw node IPs and high ports.
+- **LoadBalancer** — everything NodePort does, *plus* it asks the cloud provider
+  (via the cloud-controller-manager from Chapter 6) to provision an external load
+  balancer with a real public IP that forwards to the NodePort on your nodes. This
+  is the usual front door for internet traffic on a managed cluster.
+
+<Callout type="note">
+There's a fourth common way in, **Ingress**, which routes external HTTP by
+hostname and path through a single load balancer to many Services. It's a layer
+above Services rather than a Service type, so we leave it here as a pointer — the
+mental model is "Services expose Pods; Ingress routes HTTP to Services."
+</Callout>
+
+</Section>
+
+<Section
+  id="cluster-dns"
+  title="Names instead of numbers: cluster DNS"
+  brief={{
+    problem: "Even a stable ClusterIP is an opaque number you'd have to look up and configure. You want to write code against a readable name.",
+    mechanism: "Every Service gets a DNS name; CoreDNS resolves it to the Service's ClusterIP, so apps connect to 'web' and the indirection happens underneath.",
+    takeaway: "You write http://web; DNS resolves it to a VIP, which kube-proxy routes to a live Pod. Every layer of churn is hidden.",
+  }}
+  quiz={{
+    question: "Your app connects to `http://web` and it just works. What did the cluster do with that name?",
+    options: [
+      { text: "Broadcast the request to every Pod and kept the first reply." },
+      { text: "Cluster DNS (CoreDNS) resolved 'web' to the Service's ClusterIP, which kube-proxy then routed to one of the live backing Pods.", correct: true },
+      { text: "Looked up a Pod IP you registered manually." },
+    ],
+  }}
+>
+
+We've been saying "talk to the VIP," but you almost never type an IP at all,
+because every Service automatically gets a **DNS name**. The cluster runs a DNS
+service — **CoreDNS** — that resolves Service names to their ClusterIPs.
+
+The naming is systematic. A Service named `web` in namespace `prod` is reachable
+at its fully-qualified name `web.prod.svc.cluster.local`, and from a Pod in the
+*same* namespace you can shorten it to just `web`. So your frontend's code or
+config simply points at `http://web` (or `http://backend.prod`), and everything
+downstream is automatic: DNS turns the name into the Service's ClusterIP,
+kube-proxy turns that VIP into a connection to one live Pod, and the Endpoints
+list guarantees that Pod is currently healthy.
+
+Stack the whole chapter into one sentence and feel how much it hides. You write a
+readable name; DNS resolves it to a stable virtual IP; kube-proxy load-balances
+that VIP to one of the Pods currently in the Endpoints list; and that Endpoints
+list is kept exactly in sync with the self-healing, rolling, scaling fleet from
+Chapter 8. Every layer of churn — new Pods, new IPs, rollouts, failures — is
+absorbed beneath a name that never changes. That is how anything in Kubernetes
+reliably talks to anything else.
+
+What we *haven't* addressed is what those Pods need besides an address: their
+configuration and their secrets. Baking those into the image is a trap, and the
+next chapter shows the way out.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Services and cluster DNS are the networking spine that makes microservices on
+Kubernetes practical.
+
+- **Kubernetes Documentation — *Service* and *Service Internal Traffic / Virtual
+  IPs and Service Proxies*.** The authoritative reference on types, Endpoints, and
+  how kube-proxy implements the VIP. `kubernetes.io/docs/concepts/services-networking/service/`
+- **Kubernetes Documentation — *DNS for Services and Pods*.** The naming scheme
+  and how CoreDNS resolves it.
+- **Kubernetes Documentation — *Ingress*.** The HTTP routing layer above Services,
+  for when you outgrow one LoadBalancer per service.
+
+Next chapter: those Pods still need configuration and credentials. We pull both
+out of the container image — where they never belonged — into ConfigMaps and
+Secrets.
+
+</Section>
+
+</ChapterReader>

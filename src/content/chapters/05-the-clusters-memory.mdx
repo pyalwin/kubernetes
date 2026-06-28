@@ -1,0 +1,328 @@
+---
+title: "The Cluster's Memory"
+chapterNumber: 5
+summary: "Every idea so far — declared desired state, control loops, Services tracking live endpoints — assumes one trustworthy place that remembers what the cluster should look like and what it currently does. That place is etcd: a consistent, replicated key-value store. This chapter explains why a cluster needs a single source of truth, how a handful of etcd members stay in agreement using consensus, and what happens when one of them dies."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { etcdQuorumNodes, etcdStateTerminal } from '@/data/foundations';
+
+<ChapterReader chapterId="05-the-clusters-memory">
+
+<Section
+  id="needs-memory"
+  title="Why a cluster needs a memory"
+  brief={{
+    problem: "Control loops compare desired state to actual state — but that comparison is meaningless unless both halves are written down somewhere every component can trust.",
+    mechanism: "A central store holds the whole picture: the desired state you declared and the actual state components report. Loops read and write only there.",
+    takeaway: "Without one authoritative memory, 'make reality match the declaration' has no declaration to match against. The store is the precondition for everything else.",
+  }}
+  quiz={{
+    question: "Why can't control loops just keep desired and actual state in each component's own memory?",
+    options: [
+      { text: "Components don't have enough RAM for it." },
+      { text: "Loops in different processes and on different machines would each have their own private, possibly conflicting picture — there'd be no single truth to reconcile toward.", correct: true },
+      { text: "Local memory is too slow to read." },
+    ],
+  }}
+>
+
+Every chapter so far has quietly leaned on something we never opened. Chapter 1's
+control loop "compares desired state to actual state." Chapter 4's Service
+controller "watches Pods come and go" and keeps an endpoint list current. Both
+sentences assume there is a *somewhere* — a place that holds what the cluster
+should look like and what it currently does, that every component can read from
+and write to and *believe*. This chapter is about that somewhere.
+
+Think about what a control loop actually requires to function. To act, it must
+answer two questions: "what *should* be true?" (desired state — your three
+replicas, your Service definition) and "what *is* true?" (actual state — two
+replicas running, this Pod healthy, that node gone). Then it acts to close the
+gap. But where do those two answers live? If each loop kept its own private notion
+in its own process memory, you'd have a hall of mirrors: the replica controller
+believes one thing, the scheduler another, your `kubectl` a third — and when they
+disagree, *which one is right?* There'd be no answer, because there'd be no single
+truth.
+
+So a cluster needs a **memory**: one authoritative store that holds the entire
+picture, that every component treats as the source of truth. Desired state is
+written there (you declare it through the API server). Actual state is written
+there (components report what they observe). And reconciliation becomes
+well-defined: read both halves from the *one* place, compare, act, write the
+result back to that *same* place. No private opinions, no ambiguity about who's
+right.
+
+<Callout type="note">
+This reframes the API server from Chapter 1. It's the single front door — but a
+door to *what*? To this memory. The API server is the guarded, validated entrance;
+the store behind it is where the state actually rests. Everything the cluster
+"knows" lives in that store, and everything that wants to know it goes through the
+door.
+</Callout>
+
+In Kubernetes, that memory is **etcd**: a consistent, replicated key-value store.
+The rest of this chapter unpacks those three adjectives — *key-value*,
+*replicated*, *consistent* — because each one is solving a specific, hard problem,
+and together they're what make a single source of truth actually trustworthy.
+
+</Section>
+
+<Section
+  id="what-etcd-is"
+  title="A key-value store, and why that's enough"
+  brief={{
+    problem: "The cluster's state is rich and structured — Pods, Services, nodes, secrets — so it seems like it'd need a complex database.",
+    mechanism: "etcd is a simple key-value store: keys are hierarchical paths, values are blobs. Kubernetes serializes each object to a value under a well-known key.",
+    takeaway: "Simplicity is the feature. A small, well-understood data model is far easier to make consistent and replicated than a rich one.",
+  }}
+  quiz={{
+    question: "Why is a plain key-value store a good fit for the cluster's source of truth?",
+    options: [
+      { text: "It can store more data than a relational database." },
+      { text: "Its data model is simple enough to make strongly consistent and replicated, which is exactly what a single source of truth needs.", correct: true },
+      { text: "It encrypts everything by default, unlike other databases." },
+    ],
+  }}
+>
+
+You might expect the brain of a system as elaborate as Kubernetes to be an
+elaborate database. It's the opposite, and the modesty is deliberate. **etcd** is
+a **key-value store**: at heart, a reliable, persistent map from keys to values.
+Keys are organized as hierarchical paths, a bit like file paths; values are
+opaque blobs of bytes.
+
+Kubernetes uses it in the most direct way imaginable. Every object — a Pod, a
+Deployment, a Service, a Secret — is serialized (today as Protocol Buffers) and
+stored as the *value* under a *key* that encodes what and where it is, along the
+lines of:
+
+```text
+/registry/pods/default/web-7c4b        →  { ...the Pod object... }
+/registry/deployments/default/web      →  { ...the Deployment object... }
+/registry/services/default/web         →  { ...the Service object... }
+```
+
+When you `kubectl apply` a Deployment, the API server validates it and writes its
+serialized form to a key like the one above. When the scheduler decides a Pod
+belongs on `node-2`, that decision is a write updating the Pod's value. When a
+controller reads desired state, it's reading a value back out. The whole cluster's
+knowledge is just keys and values in this one store.
+
+Why settle for something so plain? Because **simplicity is what makes the hard
+guarantees achievable.** The next two sections demand that this store be both
+*replicated* across several machines and *strongly consistent* — and those
+properties are brutally difficult to provide over a rich, sprawling data model
+with joins and transactions across many tables. Over a humble key-value map, they
+are merely *very* difficult, and well-understood. By keeping the data model
+small, etcd spends all its cleverness where it counts: keeping copies in perfect
+agreement.
+
+<Callout type="tip">
+etcd also supports **watches**: a client can ask to be notified the moment a key
+changes, instead of polling. This is the engine behind Kubernetes feeling
+*live* — when you delete a Pod, controllers find out through a watch and react in
+milliseconds. The control loops of Chapter 1 don't busy-wait; they're woken by
+etcd watches fired through the API server.
+</Callout>
+
+</Section>
+
+<Section
+  id="replicated"
+  title="Replicated: surviving a dead machine"
+  brief={{
+    problem: "If the single source of truth lived on one machine, that machine's disk failure would erase the cluster's entire memory — a catastrophic single point of failure.",
+    mechanism: "Run several etcd members on separate machines, each holding a full copy of the data, so the loss of one member loses no information.",
+    cost: "Multiple copies that must all agree introduces the hard problem the next section solves: keeping the copies identical.",
+    takeaway: "Replication trades a single point of failure for a coordination problem — a very good trade, because the coordination is solvable.",
+  }}
+  quiz={{
+    question: "Why is the cluster's state stored on several etcd members instead of one?",
+    options: [
+      { text: "To spread the data so each member only holds a fraction." },
+      { text: "So that if one machine dies, full copies survive on the others and no state is lost.", correct: true },
+      { text: "To make reads slower but more secure." },
+    ],
+  }}
+>
+
+A single source of truth has an obvious, terrifying weakness: if it lives on *one*
+machine, that machine is a single point of failure for the entire cluster. Its
+disk dies, or it catches fire, and the cluster's complete memory — every Pod,
+every Service, every declared intent — is simply gone. The control plane goes
+blind. That risk is unacceptable for the thing everything else depends on.
+
+The defense is **replication**: run several copies of etcd — its **members** — on
+separate machines, each holding the *full* dataset. Note this is replication, not
+sharding. Each member is a complete copy of everything, not a slice. Lose one
+member and the others still hold the entire picture; the cluster's memory
+survives. A typical production cluster runs three or five etcd members on
+different machines (often in different failure domains, like separate racks or
+availability zones) precisely so that no single failure — and, with five, no
+*double* failure — can erase the truth.
+
+But replication quietly hands you a new, harder problem in exchange for solving
+the first. The instant there are several copies of the data, you have to keep them
+*identical*. Picture a write arriving — "the web Deployment now wants 3 replicas"
+— while three members are meant to agree. What if the write reaches member 1 but a
+network blip delays it to members 2 and 3? Now member 1 says "3 replicas" and the
+others still say "2." A controller reading from member 1 and another reading from
+member 2 would see *different desired states* and fight each other forever. You'd
+have rebuilt the hall of mirrors from the first section, just on more machines.
+
+So replication is necessary but not sufficient. Several copies protect against a
+dead machine, but only if those copies are guaranteed to tell the *same story*.
+The cluster needs its memory to be not merely backed up, but **consistent** — every
+member agreeing on every value, in the same order, even as machines fail and
+networks misbehave. Producing that agreement is the deepest trick in this chapter,
+and it has a name: consensus.
+
+</Section>
+
+<Section
+  id="consensus"
+  title="Consistent: agreement through consensus"
+  brief={{
+    problem: "Several replicas must agree on every write and its order, even though machines crash and networks drop and delay messages at the worst moments.",
+    mechanism: "A consensus algorithm (Raft) elects one leader to order all writes, and commits a write only once a majority — a quorum — has durably stored it.",
+    takeaway: "Quorum-based consensus is what makes many copies behave like one honest memory: a write counts only when the majority agrees, so there's never a split story.",
+  }}
+  quiz={{
+    question: "In a 3-member etcd cluster, how many members must store a write before it's committed?",
+    options: [
+      { text: "All 3 — every member must agree or the write fails." },
+      { text: "A majority — 2 of 3 — which is the quorum.", correct: true },
+      { text: "Just 1 — the leader decides alone." },
+    ],
+  }}
+>
+
+Making several machines agree, while any of them can crash and the network can
+drop or delay messages, is one of the genuinely hard problems in computer science.
+etcd solves it with a **consensus algorithm** called **Raft**. You don't need its
+proofs, but two ideas carry the whole chapter, so let's get them exactly right.
+
+**One leader orders the writes.** The members elect a single **leader**; the rest
+are **followers**. *All* writes go through the leader, which puts them in a
+definite order and replicates them, in that order, to the followers. This is the
+key move: rather than letting members accept writes independently and argue later
+about whose ordering was "right," everyone defers to one orderer. There's only one
+story because there's only one author. (If the leader dies, the followers hold a
+quick election and pick a new one — more on that next section.)
+
+**A write commits only with a quorum.** The leader does *not* call a write done
+the moment it has the write itself. It first replicates the entry to the
+followers and waits until a **majority** of members — a **quorum** — has durably
+stored it. Only then is the write *committed* and acknowledged to the client. For
+a 3-member cluster, quorum is 2; for 5 members, it's 3. *Majority* is the magic
+word, because of one arithmetic fact: **any two majorities of the same set must
+overlap in at least one member.** That overlap is what makes split-brain
+impossible. Two conflicting decisions can't both reach a majority, because they'd
+need to share a member, and that member won't vote for both.
+
+<Figure number="5.1" caption="A 3-member etcd cluster. Writes funnel through the leader and commit only once a majority — any 2 of the 3 — has stored them. Click each member.">
+  <Diagram client:visible id="ch5-quorum" title="etcd: leader and quorum" nodes={etcdQuorumNodes} />
+</Figure>
+
+Put the two ideas together and the three adjectives from earlier finally click.
+*Replicated*: every member holds the full data. *Consistent*: one leader orders
+every change and a majority must agree before it counts, so all members converge
+on the identical sequence of values. From the API server's perspective, this
+distributed cluster of machines behaves like a *single*, honest, never-forgetting
+memory — which is exactly the illusion the rest of Kubernetes is built on. Many
+machines, one truth.
+
+</Section>
+
+<Section
+  id="member-dies"
+  title="When a member dies"
+  brief={{
+    problem: "Replication and consensus are only worth anything if the cluster keeps working when a machine actually fails — which is the whole reason for multiple members.",
+    mechanism: "As long as a quorum survives, the cluster keeps committing writes; if the dead member was the leader, the survivors elect a new one. Lose quorum and it goes read-only to protect the truth.",
+    takeaway: "Fault tolerance is a counting game: an N-member cluster survives the loss of the minority. That's why members come in odd numbers.",
+  }}
+  quiz={{
+    question: "A 3-member etcd cluster loses one member. What happens?",
+    options: [
+      { text: "The cluster halts entirely until the member is restored." },
+      { text: "The remaining 2 still form a quorum, so it keeps accepting writes; if the lost member was the leader, the survivors elect a new one.", correct: true },
+      { text: "Writes succeed but are no longer durable." },
+    ],
+  }}
+>
+
+Now the test that makes all of this real. The entire point of replication and
+consensus was to survive failure — so what *actually* happens when an etcd member
+dies? The answer is a counting game, and it's the reason etcd clusters come in odd
+numbers like 3 and 5.
+
+**Lose a follower, keep a quorum.** In a 3-member cluster, if one follower dies,
+two members remain — and two is still a majority of three. Quorum holds. Writes
+keep committing (the leader just needs *one* of the two survivors, which is
+itself, plus the other follower, to agree). The cluster doesn't even hiccup;
+clients notice nothing. When the dead member is repaired and rejoins, the leader
+catches it up on everything it missed, and it's a full participant again.
+
+**Lose the leader.** If the member that dies is the *leader*, the followers stop
+hearing its periodic heartbeat, conclude it's gone, and hold an **election**: a
+surviving member campaigns, and if a majority votes for it, it becomes the new
+leader. This takes a beat — typically a second or so — during which writes pause,
+then resume seamlessly through the new leader. No state is lost, because every
+committed write was, by definition, already on a majority, which necessarily
+includes at least one member that's still alive.
+
+**Lose quorum.** Here's the hard edge. In a 3-member cluster, if *two* members
+die, only one remains — and one is *not* a majority of three. The cluster can no
+longer reach quorum, so it deliberately **stops accepting writes** and goes
+read-only. This looks like a failure, but it's the system protecting the truth:
+rather than let a lone member accept writes it can't prove won't conflict with the
+others when they return, etcd refuses. *Consistency is preserved at the cost of
+availability* — it would rather pause than risk telling two different stories.
+
+<Figure number="5.2" caption="Asking the cluster what it remembers. Desired and actual replica counts and member health all read back out of the same etcd-backed store, through the API server.">
+  <KubectlTerminal client:visible id="ch5-term" commands={etcdStateTerminal} prompt="$" />
+</Figure>
+
+This is why **odd numbers** are the rule. A 3-member cluster tolerates 1 failure;
+a 5-member cluster tolerates 2. Going from 3 to 4 members buys you *nothing* — 4
+still only tolerates 1 failure (you need 3 to keep a majority), while giving you
+one *more* machine that can fail. Odd sizing gets you the most fault tolerance per
+member. And it closes the loop on the whole book so far: the desired state you
+declare, the actual state controllers observe, the endpoints a Service tracks —
+all of it rests on this small, stubborn store that would sooner stop than forget.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The consensus and quorum reasoning here is grounded in the Raft paper and etcd's
+own operational documentation.
+
+- **Ongaro & Ousterhout, *In Search of an Understandable Consensus Algorithm
+  (Raft)* (USENIX ATC, 2014).** The leader-election and log-replication algorithm
+  etcd implements. `raft.github.io`
+- **etcd Documentation — *FAQ* and *Disaster Recovery*.** Quorum math, recommended
+  odd cluster sizes, and what happens when members are lost.
+  `etcd.io/docs/`
+- **Kubernetes Documentation — *Operating etcd clusters for Kubernetes* and
+  *Kubernetes Components*.** How the control plane uses etcd as its backing store
+  behind the API server. `kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/`
+
+This closes Part I. You now have the full foundation, bottom to top: a container
+is a Linux process (Ch. 2) shaped by kernel tricks (Ch. 3), given an identity on
+the network (Ch. 4), with all of it remembered in a consistent store (Ch. 5) that
+the control loops of Chapter 1 reconcile against. Part II climbs up from these
+foundations into the control plane that puts them to work.
+
+</Section>
+
+</ChapterReader>

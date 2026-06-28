@@ -1,0 +1,232 @@
+---
+title: "Storage, Deeper"
+chapterNumber: 16
+summary: "A container's filesystem dies with the container — fine for a web server, fatal for a database. This chapter follows a pod's request for durable storage all the way down: the CSI that lets any vendor plug in, the StorageClass that provisions disks on demand, the PVC→PV binding that connects a claim to a real volume, and the reclaim policy that decides what happens when it's all deleted."
+readingTime: "22 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import { pvcBindingNodes } from '@/data/advanced';
+
+<ChapterReader chapterId="16-storage-deeper">
+
+<Section
+  id="ephemeral"
+  title="The disk that disappears"
+  brief={{
+    problem: "A container's writable layer is ephemeral — when the pod dies or is rescheduled, everything written inside it is gone.",
+    mechanism: "Durable workloads need storage that exists independently of any pod and can be reattached wherever the pod lands.",
+    takeaway: "Persistent storage in Kubernetes is deliberately decoupled from the pod's lifecycle.",
+  }}
+  quiz={{
+    question: "What happens to data written inside a container's own filesystem when the pod is rescheduled to another node?",
+    options: [
+      { text: "It moves automatically with the pod." },
+      { text: "It is lost — the container's writable layer is ephemeral and does not survive the pod.", correct: true },
+      { text: "It is backed up to etcd." },
+    ],
+  }}
+>
+
+Everything you've run so far could afford to forget. A web server's container can be
+killed and recreated on another node, and nobody notices — it holds no state worth
+keeping. That's because a container's filesystem is **ephemeral**: it's a thin
+writable layer on top of the image, and it evaporates when the container goes away.
+Reschedule the pod and it comes back blank.
+
+For a database, an upload service, or anything that *remembers*, that's a
+catastrophe. These workloads need storage that lives **independently of any pod** —
+a real disk that exists before the pod, survives the pod, and can be reattached
+wherever the pod is next scheduled. The whole design of Kubernetes storage follows
+from that one requirement: separate the lifecycle of the data from the lifecycle of
+the pod, completely.
+
+The rest of this chapter is the machinery that makes that separation work — and,
+pleasingly, it's the same declarative, pluggable, control-loop shape you've seen
+everywhere else, pointed at disks.
+
+</Section>
+
+<Section
+  id="csi"
+  title="The CSI: any storage, one interface"
+  brief={{
+    problem: "There are dozens of storage backends — cloud disks, Ceph, NFS, vendor SANs — and Kubernetes can't hardcode support for each.",
+    mechanism: "The Container Storage Interface (CSI) is a standard contract; each vendor ships a CSI driver that knows how to create, attach, and delete volumes on its backend.",
+    takeaway: "Supporting new storage means installing a driver, not changing Kubernetes — the same pluggability pattern as the CNI.",
+  }}
+  quiz={{
+    question: "How does Kubernetes support a specific storage backend like AWS EBS or Ceph?",
+    options: [
+      { text: "The support is built into the Kubernetes core." },
+      { text: "A vendor-provided CSI driver implements a standard interface that Kubernetes calls.", correct: true },
+      { text: "Each pod talks to the storage backend directly over SSH." },
+    ],
+  }}
+>
+
+You just met this pattern with networking, and storage uses the same move. Kubernetes
+refuses to hardcode knowledge of every storage system on earth — cloud block disks,
+Ceph, NFS, on-prem SANs, niche vendor arrays. Instead it defines a standard contract,
+the **CSI** (Container Storage Interface), and lets each vendor implement it.
+
+A storage vendor ships a **CSI driver** — software that runs in your cluster and
+knows how to do the vendor-specific work: create a volume, attach it to a node, mount
+it into a pod, detach it, and delete it. Kubernetes speaks only to the CSI; the
+driver translates those generic calls into AWS EBS API calls, or Ceph commands, or
+whatever the backend needs.
+
+<Callout type="note">
+This is the *exact* shape of the CNI from the last chapter. Kubernetes defines an
+interface and stays out of the implementation; vendors plug in. Adding support for a
+new storage system means installing its CSI driver — no patch to Kubernetes itself.
+The platform stays small while the ecosystem grows around it.
+</Callout>
+
+With a driver installed, the cluster can now *provision real storage on demand* — but
+you don't call the driver directly. You ask for storage in Kubernetes' own terms, and
+let a controller drive the CSI for you. Those terms are the next two objects.
+
+</Section>
+
+<Section
+  id="claims-and-classes"
+  title="Claims, classes, and dynamic provisioning"
+  brief={{
+    problem: "Pre-creating a PersistentVolume by hand for every workload doesn't scale and forces app authors to know the storage details.",
+    mechanism: "A pod creates a PersistentVolumeClaim naming a StorageClass; the class's provisioner dynamically creates a matching PersistentVolume and Kubernetes binds them.",
+    takeaway: "A PVC is an abstract request for storage; the StorageClass turns it into a real disk automatically.",
+  }}
+  quiz={{
+    question: "What does a StorageClass enable when a PVC referencing it is created?",
+    options: [
+      { text: "Dynamic provisioning — the named provisioner creates a matching PV on demand.", correct: true },
+      { text: "Faster image pulls for the pod." },
+      { text: "Automatic encryption of etcd." },
+    ],
+  }}
+>
+
+Two objects model storage from opposite ends. A **PersistentVolume (PV)** is a piece
+of real storage in the cluster — a specific disk, with a size and an access mode. A
+**PersistentVolumeClaim (PVC)** is a *request* for storage by a pod: "I need 10Gi,
+read-write-once." The pod mounts the PVC and never has to know which physical disk
+backs it. That indirection is the point: the app author asks for capacity, not for a
+particular volume.
+
+Pre-creating PVs by hand, though, doesn't scale — and it drags storage details back
+into the app author's lap. The fix is the **StorageClass**, and it's where the CSI
+driver gets put to work. A StorageClass names a **provisioner** (a CSI driver) plus
+parameters:
+
+```yaml
+kind: StorageClass
+metadata: { name: fast-ssd }
+provisioner: ebs.csi.aws.com
+parameters: { type: gp3 }
+reclaimPolicy: Delete
+```
+
+Now a PVC just references it:
+
+```yaml
+kind: PersistentVolumeClaim
+spec:
+  storageClassName: fast-ssd
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 10Gi } }
+```
+
+This triggers **dynamic provisioning**. A controller sees an unbound PVC asking for
+`fast-ssd`, calls that class's provisioner (the EBS CSI driver), which creates a real
+gp3 disk and produces a PV representing it. Kubernetes then **binds** the PVC to that
+PV, and the pod mounts it. No admin pre-provisioned anything; no one waited. Here's
+that flow:
+
+<Figure number="16.1" caption="Dynamic provisioning: a PVC names a class, the provisioner creates a real disk and a PV, and Kubernetes binds claim to volume. Click each step.">
+  <Diagram client:visible id="ch16-binding" title="PVC → Provisioner → PV" nodes={pvcBindingNodes} />
+</Figure>
+
+This is exactly how a StatefulSet from Chapter 14 gives each pod its own disk: every
+pod's PVC triggers the provisioner, and a fresh PV appears, bound to that pod.
+
+</Section>
+
+<Section
+  id="reclaim"
+  title="Reclaim policy: what happens at the end"
+  brief={{
+    problem: "When a PVC is deleted, someone has to decide whether the real underlying disk — and its data — is destroyed or kept.",
+    mechanism: "The reclaim policy on the PV/StorageClass decides: Delete removes the backing volume; Retain keeps it for manual recovery.",
+    cost: "Retain leaves released volumes lying around that an admin must eventually clean up by hand.",
+    takeaway: "Choosing Retain for important data is cheap insurance against an accidental deletion destroying it.",
+  }}
+  quiz={{
+    question: "A PV has reclaimPolicy Delete. What happens to the real disk when its PVC is deleted?",
+    options: [
+      { text: "The underlying volume is deleted along with the claim.", correct: true },
+      { text: "Nothing — the disk is always preserved." },
+      { text: "It is automatically snapshotted to a new PV." },
+    ],
+  }}
+>
+
+There's one decision left, and it's the one that bites people: when a PVC is deleted
+and its PV is released, what happens to the **real disk** underneath? That's set by
+the **reclaim policy**.
+
+- **Delete** — the provisioner destroys the backing volume too. The CSI driver tells
+  the storage backend to delete the actual disk, and the data is gone. This is the
+  sensible default for scratch space, caches, and dev environments, where keeping
+  orphaned disks just wastes money.
+- **Retain** — the PV (and its data) is *kept* after the claim disappears. The volume
+  moves to a `Released` state but is not reused or erased. An admin can later inspect
+  it, recover the data, archive it, and clean it up manually.
+
+The difference is the difference between "convenient" and "safe." A `Delete` policy
+on your production database means a single fat-fingered `kubectl delete pvc` can
+destroy the disk along with the claim — irreversibly.
+
+<Callout type="tip">
+For anything you'd be sad to lose, set **Retain**. It costs you the chore of cleaning
+up released volumes by hand, and buys you a recoverable copy when someone deletes the
+wrong thing. That's a trade worth making for stateful data every time.
+</Callout>
+
+Step back and the whole chapter is one idea: data's lifecycle is decoupled from the
+pod's. The CSI lets any backend plug in; the StorageClass provisions on demand; the
+PVC→PV binding connects an abstract request to a concrete disk; and the reclaim
+policy decides the disk's fate when the claim is gone. A pod can come and go freely
+because none of its durable state lives inside it.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The storage documentation separates the user-facing concepts (PVs, PVCs,
+StorageClasses) from the implementation contract (CSI), and both halves are worth
+reading.
+
+- **Kubernetes Documentation — *Persistent Volumes*.** PVs, PVCs, binding, access
+  modes, and reclaim policies in depth.
+  `kubernetes.io/docs/concepts/storage/persistent-volumes/`
+- **Kubernetes Documentation — *Storage Classes* and *Dynamic Volume
+  Provisioning*.** How a class plus a provisioner turns a claim into a disk.
+  `kubernetes.io/docs/concepts/storage/storage-classes/`
+- **Kubernetes Documentation — *Container Storage Interface (CSI)*.** The driver
+  contract that lets any storage system plug in.
+  `kubernetes.io/docs/concepts/storage/volumes/#csi`
+
+Next chapter: storage and networking decide what a workload *can touch*. Identity and
+permission decide what it's *allowed* to — we turn to RBAC, ServiceAccounts, and pod
+security.
+
+</Section>
+
+</ChapterReader>

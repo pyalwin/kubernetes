@@ -1,0 +1,238 @@
+---
+title: "Scaling Without Watching"
+chapterNumber: 19
+summary: "Traffic is never flat, and nobody should be awake to resize the fleet when it spikes. This chapter meets the three autoscalers — one that adds Pod copies, one that right-sizes each Pod, and one that adds machines — and shows how they chain into a system that follows load on its own."
+readingTime: "22 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import { autoscalingNodes } from '@/data/production';
+
+<ChapterReader chapterId="19-scaling-without-watching">
+
+<Section
+  id="the-spike"
+  title="The 9am spike"
+  brief={{
+    problem: "Real traffic is bursty — quiet at night, on fire during a sale. Pick a fixed replica count and you are either wasting money or dropping requests.",
+    mechanism: "You could sit and watch a dashboard and edit the replica count by hand. That is the manual control loop from Chapter 1, back again — and just as untenable.",
+    cost: "A human resizing the fleet is slow, error-prone, and never on call at 3am.",
+    takeaway: "Scaling is a loop: observe load, compare to capacity, adjust. It begs to be automated.",
+  }}
+  quiz={{
+    question: "Why is a single fixed replica count a poor fit for production traffic?",
+    options: [
+      { text: "Fixed counts are forbidden by the API server." },
+      { text: "Traffic rises and falls, so any fixed number is either wasteful when quiet or too small when busy.", correct: true },
+      { text: "Replicas can only be set once at install time." },
+    ],
+  }}
+>
+
+Picture a storefront. At 4am it serves a trickle; two copies of the app are
+plenty. At 9am a promotion goes live and traffic is ten times higher. If you
+sized the Deployment for the quiet hours, the morning melts it down. If you sized
+it for the spike, you pay for eight idle copies all night.
+
+The obvious fix is the wrong one: *watch a graph and edit `replicas` when it gets
+busy.* You already know how this ends — it is the same hand-cranked control loop
+that motivated the whole system. Someone has to be looking. Someone has to react
+in seconds. Someone has to be awake.
+
+So we want the cluster to do what it already does for *failures* — observe,
+compare, act — but pointed at **load** instead. That turns out to need not one
+autoscaler but three, because "scale" means three different things: more copies
+of the app, a better-fitting size for each copy, and more machines to put them
+on. The rest of this chapter takes them one at a time, then shows how they snap
+together.
+
+</Section>
+
+<Section
+  id="horizontal"
+  title="More copies: the Horizontal Pod Autoscaler"
+  brief={{
+    problem: "When each Pod is maxed out, you need more Pods — and you need them created automatically, the moment load rises.",
+    mechanism: "The HorizontalPodAutoscaler runs a control loop: read a metric, compare to a target utilization, and change the Deployment's replica count to close the gap.",
+    takeaway: "The HPA changes how many Pods exist; it scales out and back in to track load.",
+  }}
+  quiz={{
+    question: "Your Pods are averaging 90% CPU against a 50% target. What does the HPA do?",
+    options: [
+      { text: "Gives each Pod a bigger CPU limit." },
+      { text: "Increases the replica count so the same load spreads across more Pods, pulling average utilization down toward 50%.", correct: true },
+      { text: "Adds a new node and stops there." },
+    ],
+  }}
+>
+
+The **HorizontalPodAutoscaler** — HPA — is the one most people mean when they say
+"autoscaling." It changes the *number* of Pod replicas. You give it a target,
+most often average CPU utilization, and it runs the familiar loop: read the
+current metric, compare it to the target, and adjust the replica count to close
+the gap.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+spec:
+  scaleTargetRef: { kind: Deployment, name: web }
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 50 }
+```
+
+Read it as a sentence: *keep `web` between 2 and 20 copies, sized so the average
+Pod sits near 50% CPU.* When the morning spike pushes Pods to 90%, the HPA adds
+replicas until the average falls back toward target; when the rush passes, it
+removes them. CPU is only the default — the HPA can also scale on memory or, far
+more usefully, on **custom and external metrics** like requests per second or
+queue depth, which track user-facing load much more honestly than CPU does.
+
+<Callout type="tip">
+The HPA does not scale on a whim. It uses a stabilization window and a
+ratio-based formula so a brief blip doesn't thrash the replica count up and down.
+Smooth is the goal: follow the trend, ignore the noise.
+</Callout>
+
+</Section>
+
+<Section
+  id="vertical"
+  title="Better-sized copies: the Vertical Pod Autoscaler"
+  brief={{
+    problem: "Adding copies doesn't help if each copy was sized wrong to begin with — too small and it throttles or gets OOM-killed; too big and you waste the reservation.",
+    mechanism: "The VerticalPodAutoscaler observes real usage and adjusts a Pod's CPU/memory requests and limits to fit, restarting the Pod to apply the new size.",
+    takeaway: "The VPA changes how big each Pod is, not how many there are.",
+  }}
+  quiz={{
+    question: "What does the VerticalPodAutoscaler change?",
+    options: [
+      { text: "The number of replicas in the Deployment." },
+      { text: "The CPU and memory requests/limits of each Pod, to match its actual usage.", correct: true },
+      { text: "The number of nodes in the cluster." },
+    ],
+  }}
+>
+
+Horizontal scaling assumes each Pod is the *right size*. Often it isn't. You
+guessed `100m` of CPU at design time; the app actually wants `400m`. Now it
+throttles under load and the HPA, reading a misleadingly high utilization, scales
+out to paper over a sizing mistake. Guess too *high* instead and every replica
+reserves capacity it never uses, so the scheduler packs fewer Pods per node and
+you burn money.
+
+The **VerticalPodAutoscaler** — VPA — fixes the size rather than the count. It
+watches a workload's real consumption over time and recommends (or, in auto mode,
+applies) corrected `requests` and `limits`. Because changing a running Pod's
+resources means recreating it, the VPA is best on steady, long-lived workloads
+where the occasional restart is cheap.
+
+<Callout type="warning">
+Do **not** point a VPA and an HPA at the *same* resource metric. If both react to
+CPU, they fight — the VPA grows the Pod, which changes utilization, which
+confuses the HPA. Pair them only when they watch different signals (e.g. VPA on
+memory, HPA on requests-per-second), or pick one.
+</Callout>
+
+</Section>
+
+<Section
+  id="cluster"
+  title="More machines: the Cluster Autoscaler"
+  brief={{
+    problem: "The HPA can ask for 20 Pods, but Pods need somewhere to run. If no node has room, the new Pods just sit Pending.",
+    mechanism: "The Cluster Autoscaler watches for unschedulable Pods and adds nodes to the pool; when nodes sit idle, it drains and removes them.",
+    takeaway: "The Cluster Autoscaler changes how many machines exist, closing the loop the HPA opens.",
+  }}
+  quiz={{
+    question: "The HPA scaled to 20 replicas but several Pods are stuck Pending. Who resolves it?",
+    options: [
+      { text: "The HPA forces the extra Pods onto already-full nodes." },
+      { text: "The Cluster Autoscaler sees the unschedulable Pods and adds a node so they can be placed.", correct: true },
+      { text: "metrics-server reschedules them automatically." },
+    ],
+  }}
+>
+
+There is a ceiling the HPA can't break through on its own. It can *request* 20
+Pods, but if the existing nodes are full, the scheduler has nowhere to put the
+extras and they sit in `Pending`. More copies you can't place are not more
+capacity.
+
+The **Cluster Autoscaler** operates one level down, on the machines themselves.
+Its loop watches for Pods that can't be scheduled and, when it finds them, asks
+the cloud provider for another node and joins it to the cluster so the Pods land.
+Running the loop in reverse, when a node has been underused long enough and its
+Pods can fit elsewhere, it cordons the node, drains those Pods, and deletes the
+machine — so the bill tracks real demand instead of peak demand.
+
+</Section>
+
+<Section
+  id="together"
+  title="How the three fit together"
+  brief={{
+    problem: "Three autoscalers acting on three dimensions could be chaos; you need to see them as one system.",
+    mechanism: "They chain: the VPA keeps each Pod honestly sized, the HPA sets how many Pods, and the Cluster Autoscaler supplies machines for them — all fed by metrics-server.",
+    takeaway: "Autoscaling is a stack of cooperating control loops, each closing the gap the one above it opens.",
+  }}
+  quiz={{
+    question: "What does metrics-server provide to this system?",
+    options: [
+      { text: "It schedules Pods onto nodes." },
+      { text: "It collects per-Pod CPU and memory and serves it through the metrics API, which kubectl top and the HPA both read.", correct: true },
+      { text: "It stores the cluster's desired state." },
+    ],
+  }}
+>
+
+Step back and the three line up into a single pipeline. The **VPA** keeps each
+Pod's requests honest, so the numbers everyone else reasons about are real. The
+**HPA** decides *how many* of those right-sized Pods you need for the current
+load. And when that number of Pods won't fit, the **Cluster Autoscaler** adds the
+machines to hold them. Each loop closes a gap the loop above it opens.
+
+<Figure number="19.1" caption="The two scale-out loops, chained: the HPA adds Pods to absorb load; when those Pods can't be placed, the Cluster Autoscaler adds nodes to hold them. Click each to see its job.">
+  <Diagram client:visible id="ch19-autoscalers" title="Load becomes capacity" nodes={autoscalingNodes} />
+</Figure>
+
+Underneath all of it sits one humble dependency: **metrics-server**. It is a
+lightweight component that scrapes per-Pod CPU and memory from each node's
+kubelet and serves it through the metrics API. It is what `kubectl top` reads,
+and it is what the HPA reads to make every decision. No metrics-server, no
+horizontal autoscaling and no `top` — the loops would be blind. Install it once,
+and the whole stack above can finally watch load so you don't have to.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The autoscalers are documented separately because they ship and evolve
+separately — but the mental model above is the one the docs assume.
+
+- **Kubernetes Documentation — *Horizontal Pod Autoscaling*.** The HPA
+  algorithm, the v2 metrics API, and stabilization behavior.
+  `kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/`
+- **Kubernetes Documentation — *Resource Metrics Pipeline* (metrics-server).**
+  How per-Pod CPU/memory is collected and served.
+- **autoscaler GitHub repository (`kubernetes/autoscaler`).** The canonical home
+  of the Cluster Autoscaler and the VPA, including provider-specific notes.
+
+Next chapter: scaling decisions are only as good as the signals behind them. In
+*Knowing What's Happening* we turn to observability — the logs, metrics, and
+traces that tell you what the cluster is actually doing.
+
+</Section>
+
+</ChapterReader>

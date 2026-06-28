@@ -1,0 +1,234 @@
+---
+title: "Carving Up a Cluster"
+chapterNumber: 12
+summary: "One cluster, many teams. Without boundaries their names collide, and one runaway Pod starves everyone else's. This chapter adds the two mechanisms that make a shared cluster safe: namespaces that partition it logically, and requests and limits that govern who gets which slice of compute."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { namespaceTerminal } from '@/data/core';
+
+<ChapterReader chapterId="12-carving-up-a-cluster">
+
+<Section
+  id="shared-cluster"
+  title="One cluster, many tenants"
+  brief={{
+    problem: "Running a cluster per team is wasteful, but throwing every team into one flat cluster means name collisions and no blast-radius boundaries.",
+    mechanism: "Partition the single cluster into named virtual sub-clusters so each team gets its own scope for names and a boundary for policy.",
+    takeaway: "Sharing a cluster safely needs logical partitions — that's what a namespace is.",
+  }}
+  quiz={{
+    question: "What problem does sharing a single flat cluster across many teams create?",
+    options: [
+      { text: "The cluster runs out of IP addresses immediately." },
+      { text: "Names collide and there's no boundary for access, quotas, or blast radius between teams.", correct: true },
+      { text: "Only one team can deploy at a time." },
+    ],
+  }}
+>
+
+Everything in Part II has assumed one app's point of view. Real clusters host
+*many* apps from *many* teams, and that raises a question we've dodged until now:
+how do you share one cluster without the tenants stepping on each other?
+
+The naive answer — a separate cluster per team — is simple but wasteful. Each
+cluster needs its own control plane, its own spare capacity, its own upgrades to
+babysit. Ten teams becomes ten of everything. Most organizations would rather run
+*one* big cluster and slice it up.
+
+But a single flat cluster has its own problems. Two teams both want a Deployment
+called `web` — now their names collide. One team's experiment spawns a thousand
+Pods and starves everyone else. A junior engineer's `kubectl delete` hits the
+wrong objects because everything lives in one undivided space. Sharing without
+boundaries is chaos.
+
+So Kubernetes gives you a way to carve one physical cluster into logical
+partitions, each with its own scope for names and its own boundary for policy.
+That partition is the **namespace**, and paired with the resource controls in the
+back half of this chapter, it's what makes multi-tenancy safe. We'll take the two
+in turn: first the *spatial* boundary (namespaces), then the *compute* boundary
+(requests, limits, and quotas).
+
+</Section>
+
+<Section
+  id="namespaces"
+  title="Namespaces: scopes inside one cluster"
+  brief={{
+    problem: "Teams need isolated names and a unit to attach access control and policy to, without the cost of separate clusters.",
+    mechanism: "A namespace is a virtual sub-cluster: most objects live in one, names need only be unique within it, and RBAC and quotas attach to it.",
+    cost: "Some objects (nodes, PVs, the namespaces themselves) are cluster-wide and not namespaced.",
+    takeaway: "A namespace is a scope for names and a handle for policy — a virtual cluster inside the cluster.",
+  }}
+  quiz={{
+    question: "Two teams each deploy a Service named `web`. How do namespaces prevent a collision?",
+    options: [
+      { text: "Kubernetes renames the second one automatically." },
+      { text: "Names only need to be unique within a namespace, so `web` in team-a and `web` in team-b are distinct objects.", correct: true },
+      { text: "It doesn't — only one `web` can exist per cluster." },
+    ],
+  }}
+>
+
+A **namespace** is a virtual cluster inside your cluster. Most objects you've met
+— Pods, Deployments, Services, ConfigMaps, Secrets, PVCs — live *inside* a
+namespace, and a name only has to be unique *within* its namespace. So `web` in
+`team-a` and `web` in `team-b` are two entirely separate Services that never
+collide. The DNS scheme from Chapter 9 reflects this directly:
+`web.team-a.svc.cluster.local` versus `web.team-b.svc.cluster.local`.
+
+Beyond names, a namespace is the natural handle to attach **policy** to. **RBAC**
+rules grant a team access to *their* namespace and nothing else, so team-a's
+engineers simply can't touch team-b's objects. Resource quotas (next section)
+attach per namespace. It's the unit of isolation, organization, and blast-radius
+control all at once.
+
+A few objects are deliberately *not* namespaced because they're cluster-wide by
+nature: **Nodes**, **PersistentVolumes**, and namespaces themselves. That makes
+sense — a node isn't owned by one team, and a PV is a cluster-level resource that
+gets *claimed* into a namespace by a PVC.
+
+<Figure number="12.1" caption="`kubectl get namespaces` shows the built-in namespaces alongside per-team ones. The system runs its own control-plane components in kube-system.">
+  <KubectlTerminal client:visible id="ch12-term" commands={namespaceTerminal} />
+</Figure>
+
+Out of the box you get a few namespaces: `default` (where objects land if you
+don't specify one), `kube-system` (the control-plane components themselves —
+CoreDNS, kube-proxy configs, and friends), and `kube-public`. In practice you
+create a namespace per team or per environment and wire RBAC and quotas to each.
+
+</Section>
+
+<Section
+  id="requests-limits"
+  title="Requests and limits: claiming a slice of compute"
+  brief={{
+    problem: "Namespaces partition names, not CPU and memory. One greedy Pod can still starve a node everyone shares.",
+    mechanism: "Each container declares a request (guaranteed reservation the scheduler honors) and a limit (hard runtime ceiling enforced by cgroups).",
+    takeaway: "Requests are for placement; limits are for protection. Together they keep one workload from hogging a node.",
+  }}
+  quiz={{
+    question: "What is the difference between a container's resource request and its limit?",
+    options: [
+      { text: "The request is the maximum it may use; the limit is the minimum it's promised." },
+      { text: "The request is what the scheduler reserves for placement; the limit is the hard runtime ceiling enforced via cgroups.", correct: true },
+      { text: "They're two words for the same value." },
+    ],
+  }}
+>
+
+Namespaces carve up *names*, but they don't carve up *compute*. Every Pod still
+lands on some shared node, and by default a container can grab as much CPU and
+memory as the machine has — so one runaway process can starve every other Pod on
+the node. The fix is to make each container declare its appetite with two numbers.
+
+A **request** is what the container is *guaranteed*. It's the amount of CPU and
+memory the **scheduler** sets aside when deciding where the Pod goes. Recall the
+scheduler from Chapter 6: it only places a Pod on a node where the sum of all
+requests still fits. So requests are fundamentally about **placement** — they're
+the reservation that keeps a node from being oversubscribed. A Pod requesting
+`500m` CPU won't be put on a node with only `200m` left.
+
+A **limit** is the *hard ceiling* the container may never exceed at runtime, and
+it's enforced by the Linux **cgroups** from way back in our container chapters.
+Here a crucial asymmetry shows up:
+
+- Exceed a **memory** limit and the container is **OOM-killed** — terminated and
+  restarted. Memory can't be throttled, so the kernel's only option is to kill.
+- Exceed a **CPU** limit and the container is **throttled** — slowed down, made to
+  wait for cycles — but *not* killed. CPU is compressible; you can always give a
+  process less of it.
+
+<Callout type="note">
+The two numbers map cleanly onto the two components: **requests → the scheduler**
+(where does this Pod fit?), **limits → cgroups on the node** (how much may it
+actually consume?). Set requests too low and nodes get oversubscribed and
+thrash; set them too high and you waste capacity. Tuning them well is most of the
+day-to-day work of running an efficient cluster.
+</Callout>
+
+</Section>
+
+<Section
+  id="quota-limitrange"
+  title="ResourceQuota and LimitRange"
+  brief={{
+    problem: "Per-container requests and limits are voluntary. Nothing yet stops a whole team from collectively consuming the entire cluster, or from omitting limits entirely.",
+    mechanism: "A ResourceQuota caps a namespace's total resource use and object counts; a LimitRange sets defaults and min/max for individual containers in it.",
+    takeaway: "Quota governs the whole namespace's budget; LimitRange governs each container — together they enforce the rules a platform team sets.",
+  }}
+  quiz={{
+    question: "A platform team wants to guarantee team-a can never use more than 4 CPUs total across all its Pods. Which object enforces that?",
+    options: [
+      { text: "A LimitRange on each container." },
+      { text: "A ResourceQuota on the team-a namespace, capping its aggregate requests and limits.", correct: true },
+      { text: "A namespace alone enforces it automatically." },
+    ],
+  }}
+>
+
+Per-container requests and limits are powerful but *voluntary* — a developer can
+set them low, high, or forget them entirely. To actually govern a shared cluster,
+a platform team needs to impose rules at the namespace level. Two objects do that,
+and they operate at different scopes.
+
+A **ResourceQuota** caps the **whole namespace's** budget. It sets hard ceilings
+on the *aggregate* across every Pod in the namespace: total `requests.cpu`, total
+`requests.memory`, total limits, and even object counts like "no more than 20
+Pods" or "no more than 5 Services." Once team-a's namespace hits its quota, new
+Pods that would exceed it are simply rejected at creation. This is how you promise
+that team-a can never consume more than its allotted share, no matter how many
+Pods it launches. Look back at the quota in the chapter's terminal: `requests.cpu`
+used `1200m` of a hard `4`.
+
+A **LimitRange** operates one level down, on **individual containers** within a
+namespace. It can set **default** requests and limits (so a Pod created *without*
+them still gets sensible values instead of unbounded access) and enforce **min and
+max** bounds per container (so nobody requests a ridiculous `64Gi` or omits limits
+to dodge throttling). Where a ResourceQuota governs the total, a LimitRange
+governs each piece.
+
+Used together, they let a platform team hand a namespace to a product team with
+guardrails already installed: "here's your slice — a quota you can't exceed and
+sane container defaults you can't accidentally skip." Combined with namespaces for
+naming and RBAC for access, that's the full multi-tenancy story: many teams, one
+cluster, no collisions and no starvation.
+
+And that closes Part II. You started with a single container and a manual restart
+loop; you now have the whole core of Kubernetes — the control plane, Pods,
+controllers that keep them alive and update them safely, stable networking,
+externalized config, durable storage, and a cluster carved up so many teams can
+share it. Every piece turned out to be the same idea wearing a different hat: a
+control loop closing the gap between what you declared and what is.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Namespaces and resource governance are where running Kubernetes shifts from
+deploying one app to operating a shared platform.
+
+- **Kubernetes Documentation — *Namespaces*, *Resource Quotas*, and *Limit
+  Ranges*.** The reference for partitioning a cluster and bounding its compute.
+  `kubernetes.io/docs/concepts/policy/`
+- **Kubernetes Documentation — *Managing Resources for Containers*.** How requests
+  and limits map to scheduling decisions and cgroup enforcement, including the
+  OOM-kill vs. CPU-throttle behavior.
+- **Kubernetes Documentation — *Quality of Service for Pods*.** How the
+  relationship between a Pod's requests and limits sorts it into Guaranteed,
+  Burstable, or BestEffort under node pressure.
+
+This is the end of Part II. Part III leaves the core behind and turns to operating
+real workloads — scheduling controls, health checks and probes, autoscaling, and
+the security model that decides who and what may do what in your cluster.
+
+</Section>
+
+</ChapterReader>

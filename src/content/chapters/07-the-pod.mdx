@@ -1,0 +1,263 @@
+---
+title: "The Pod"
+chapterNumber: 7
+summary: "Kubernetes never asks the kubelet to run a container. It asks it to run a Pod. That extra word looks like bureaucracy until you try to put a log shipper next to your app and realize two containers sometimes need to be one unit. This chapter earns the Pod by needing it."
+readingTime: "23 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { podTerminal } from '@/data/core';
+
+<ChapterReader chapterId="07-the-pod">
+
+<Section
+  id="why-not-container"
+  title="Why not just run a container?"
+  brief={{
+    problem: "You'd expect the smallest thing Kubernetes runs to be a container. But sometimes two containers need to share a disk and an address so tightly that scheduling them apart would break them.",
+    mechanism: "Kubernetes introduces a wrapper — the Pod — that groups one or more containers that are always placed together and share an environment.",
+    takeaway: "The Pod exists because 'one container' is sometimes too small a unit to schedule.",
+  }}
+  quiz={{
+    question: "Why does Kubernetes schedule Pods instead of individual containers?",
+    options: [
+      { text: "Containers are too slow to start on their own." },
+      { text: "Some containers must share a network and storage so tightly they have to be placed and scaled as a single unit.", correct: true },
+      { text: "A node can only run one container at a time." },
+    ],
+  }}
+>
+
+In Chapter 6 we left a Pod at the kubelet's doorstep without saying what one is.
+Here's the surprise: the smallest thing you can deploy in Kubernetes is *not* a
+container. It's a **Pod** — a wrapper around one or more containers that are
+always scheduled together on the same node and share parts of their environment.
+
+That sounds like needless indirection until you hit the problem it solves.
+Imagine your web app writes logs to a file, and you want a second program — a log
+shipper — to read that file and forward it elsewhere. Those two programs must run
+on the *same machine* (they share a file) and must come and go *together* (a log
+shipper with no app is pointless). If Kubernetes only knew about containers, you'd
+have no way to say "these two are a unit; never split them." You'd cross your
+fingers and hope the scheduler put them together.
+
+The Pod is the word for "these belong together." Everything in a Pod is placed on
+one node, started and stopped as a group, and given a shared context to
+collaborate through. Most Pods hold exactly one container — the wrapper costs you
+nothing in that common case — but when you genuinely need two processes glued
+into one deployable unit, the Pod is the only thing that expresses it.
+
+<Callout type="tip">
+A useful instinct: one container per Pod is the default, and you should reach for
+a second container only when it exists *purely to support the first* on the same
+machine. "Two unrelated services" is two Pods, not one.
+</Callout>
+
+</Section>
+
+<Section
+  id="shared-context"
+  title="What a Pod's containers share"
+  brief={{
+    problem: "Saying two containers are 'a unit' is empty unless they can actually cooperate — reach each other and exchange data.",
+    mechanism: "Containers in a Pod share one network namespace (one IP, reachable over localhost) and can mount the same volumes.",
+    cost: "They must coordinate ports as if they were processes on one host — two containers can't both bind :80.",
+    takeaway: "A Pod is a shared network address plus shared storage, wrapped around a group of containers.",
+  }}
+  quiz={{
+    question: "Two containers in the same Pod want to talk to each other. How do they reach each other?",
+    options: [
+      { text: "Through the Pod's Service DNS name." },
+      { text: "Over localhost — they share one network namespace and one IP, so they coordinate ports like processes on a single host.", correct: true },
+      { text: "They can't; containers in a Pod are isolated from each other." },
+    ],
+  }}
+>
+
+Calling two containers "a unit" only means something if they can actually
+cooperate. A Pod gives them two concrete things to share.
+
+**One network namespace.** The whole Pod gets a single IP address. Every
+container inside sees the same network interface and reaches the others over
+`localhost`. So the log shipper can scrape `localhost:8080` for metrics, and the
+app and shipper talk with zero network hops. The flip side: they share a port
+space. Two containers in one Pod cannot both listen on port 80, exactly as two
+processes on one host can't. From *outside*, the world addresses the Pod's IP, not
+the individual containers.
+
+**Shared volumes.** A volume declared on the Pod can be mounted into several of
+its containers. The app writes logs to `/var/log/app` on a shared volume; the
+shipper mounts the same volume and reads them. This is how containers that share
+nothing else exchange data — through a patch of filesystem they both see.
+
+What they *don't* share is just as important: each container still has its own
+filesystem root (its own image), its own process space by default, and its own
+resource limits. The Pod shares the *connective tissue* — address and storage —
+while keeping each container's code and dependencies separate. That's the precise
+amount of sharing the log-shipper problem needed, and no more.
+
+</Section>
+
+<Section
+  id="pause-and-sidecars"
+  title="The pause container and the sidecar pattern"
+  brief={{
+    problem: "If your app container crashes and restarts, the Pod's shared IP must survive — otherwise the 'shared network' would vanish every restart.",
+    mechanism: "A tiny pause container holds the Pod's network namespace open; app containers join it. Helper containers beside the main one are 'sidecars.'",
+    takeaway: "The pause container is the anchor that makes a Pod's shared identity outlive any one container restart.",
+  }}
+  quiz={{
+    question: "What is the job of the 'pause' container that Kubernetes silently runs in every Pod?",
+    options: [
+      { text: "It runs your application's main process." },
+      { text: "It holds the Pod's network namespace open so the shared IP survives even when app containers restart.", correct: true },
+      { text: "It pauses the Pod during a rolling update." },
+    ],
+  }}
+>
+
+There's a quiet mechanism that makes the shared network actually robust. If the
+Pod's IP lived inside your app container, then every time that container crashed
+and restarted, the Pod would get a new address — and the "stable shared network"
+promise would be a lie.
+
+So Kubernetes runs a nearly invisible helper in every Pod: the **pause
+container**. It does almost nothing — it starts, holds open the network namespace
+(and a few others), and sleeps. Your real containers *join* its namespace rather
+than owning one. Now your app can crash and restart all day; the pause container
+keeps holding the namespace, so the Pod's IP never moves. You rarely see it, but
+it's why a Pod's identity outlives the churn of its containers.
+
+The pattern of putting a helper container next to your main one is called a
+**sidecar**. The log shipper from earlier is the classic example. Others you'll
+meet constantly:
+
+- A **proxy** sidecar that handles TLS or routing for the app (the heart of a
+  service mesh).
+- A **config-sync** sidecar that pulls updated configuration into a shared volume.
+- An **adapter** sidecar that translates the app's metrics into a format your
+  monitoring expects.
+
+Each works only because of the two kinds of sharing from the last section: the
+sidecar reaches the app over `localhost` and exchanges files through a shared
+volume. The Pod isn't an arbitrary grouping — it's exactly the unit the sidecar
+pattern requires.
+
+</Section>
+
+<Section
+  id="lifecycle"
+  title="A Pod's lifecycle"
+  brief={{
+    problem: "A Pod isn't simply 'on' or 'off' — it's pulling images, starting, maybe finishing, maybe failing. You need to read its state to operate it.",
+    mechanism: "A Pod moves through phases — Pending, Running, Succeeded, Failed — and a restartPolicy governs what happens when a container inside exits.",
+    takeaway: "The phase tells you where a Pod is in its life; the restartPolicy tells you what happens next when something exits.",
+  }}
+  quiz={{
+    question: "A Pod shows STATUS Pending for a while. What does that most likely mean?",
+    options: [
+      { text: "The Pod's containers have all exited successfully." },
+      { text: "The Pod is accepted but not yet running — still waiting to be scheduled or pulling its images.", correct: true },
+      { text: "The Pod has permanently failed." },
+    ],
+  }}
+>
+
+Operating Pods means reading their state, so learn the vocabulary. A Pod reports
+a high-level **phase**:
+
+- **Pending** — the Pod is accepted by the cluster but not yet running. It might
+  be waiting for the scheduler to place it, or the kubelet might be pulling its
+  images. A Pod stuck Pending is one of the most common things you'll debug.
+- **Running** — the Pod is bound to a node and at least one container has started.
+- **Succeeded** — all containers exited cleanly (`0`) and won't restart. Typical
+  for one-shot Jobs, not long-running servers.
+- **Failed** — all containers terminated and at least one exited non-zero.
+
+Alongside the phase, each Pod carries a **restartPolicy** — `Always` (the default,
+for servers you want kept alive), `OnFailure`, or `Never` — that tells the kubelet
+what to do when a container *inside* the Pod exits. Note the asymmetry: the
+restartPolicy restarts containers within an existing Pod, but it never moves the
+Pod to another node. Try inspecting a Pod's phase, containers, and logs:
+
+<Figure number="7.1" caption="Reading a Pod. `kubectl describe pod web-1` shows its phase, both containers (app + sidecar), and recent events; `kubectl logs` reads one container's output.">
+  <KubectlTerminal client:visible id="ch7-term" commands={podTerminal} />
+</Figure>
+
+Notice `web-1` shows `2/2` ready — two containers, the app and its log-shipper
+sidecar, both healthy inside one Pod.
+
+</Section>
+
+<Section
+  id="never-bare"
+  title="Why you rarely create a bare Pod"
+  brief={{
+    problem: "A Pod you create by hand has nobody watching it. If its node dies, the Pod dies with it — and nothing brings it back.",
+    mechanism: "The restartPolicy restarts containers, but a Pod is never rescheduled by itself. A controller is what replaces a lost Pod.",
+    takeaway: "Bare Pods are mortal and final; you almost always want a controller wrapping them so they self-heal.",
+  }}
+  quiz={{
+    question: "You create a bare Pod (no controller) and the node it's on dies. What happens to the Pod?",
+    options: [
+      { text: "It is automatically recreated on a healthy node." },
+      { text: "It's gone — nothing reschedules a bare Pod, because no controller is watching it.", correct: true },
+      { text: "Its restartPolicy moves it to another node." },
+    ],
+  }}
+>
+
+Here's the catch that sends you to the next chapter. A Pod you create directly —
+a "bare" Pod — has *nobody watching it*. The restartPolicy can restart a crashed
+container within the Pod, but if the whole Pod is lost — its node reboots, fails,
+or is drained — there is no loop anywhere whose job is to bring it back. It simply
+vanishes. The restartPolicy restarts containers; it does not resurrect Pods.
+
+That fragility is by design. Remember the control loop from Chapter 1:
+self-healing comes from a *controller* watching desired state and acting on gaps.
+A bare Pod has no controller, so it has no desired-state guardian, so it doesn't
+self-heal. It's a one-off, and one-offs die for good.
+
+So in practice you almost never write a Pod manifest by hand. Instead you create
+a **controller** — a Deployment, StatefulSet, Job, or DaemonSet — and *it* creates
+and watches the Pods for you. Treating Pods as disposable is the whole point:
+when one dies, the controller notices the gap between "should be 3" and "are 2"
+and makes a fresh Pod, possibly on a different node. You stopped caring about
+individual Pods and started declaring how many you want.
+
+<Callout type="note">
+This is the cattle-not-pets idea made concrete. You don't name, nurse, or mourn
+individual Pods. You declare a count and a template; the controller keeps that
+true. Which raises the obvious question — *how* does a controller keep N copies
+alive? That's Chapter 8.
+</Callout>
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The Pod is the most-explained object in Kubernetes for good reason — it's the
+atom everything else is built from.
+
+- **Kubernetes Documentation — *Pods* and *Pod Lifecycle*.** The authoritative
+  description of shared namespaces, phases, and restart policies.
+  `kubernetes.io/docs/concepts/workloads/pods/`
+- **Kubernetes Documentation — *Sidecar Containers*.** The pattern and its
+  first-class support, including native sidecar startup ordering.
+- **Burns, Oppenheimer, *Design Patterns for Container-Based Distributed Systems*
+  (HotCloud, 2016).** The original taxonomy of sidecar, ambassador, and adapter
+  patterns that the Pod was built to enable.
+
+Next chapter: we wrap Pods in the controller that keeps a fixed number of them
+alive — and then in the controller that lets you swap them out, a few at a time,
+without downtime.
+
+</Section>
+
+</ChapterReader>

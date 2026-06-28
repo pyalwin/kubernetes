@@ -1,0 +1,274 @@
+---
+title: "The Control Plane, Fully"
+chapterNumber: 6
+summary: "You've been told a control loop watches reality and fixes it. But where does that loop actually run, who stores 'desired' and 'actual', and how does a single `kubectl apply` turn into containers on machines? This chapter opens the box and traces one command from your terminal to a running process."
+readingTime: "26 min"
+---
+
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import { Figure, Callout } from '@/components/scene';
+import Diagram from '@/components/Diagram';
+import KubectlTerminal from '@/components/KubectlTerminal';
+import { controlPlaneFullNodes, applyFlowTerminal } from '@/data/core';
+
+<ChapterReader chapterId="06-the-control-plane">
+
+<Section
+  id="the-box"
+  title="Opening the box"
+  brief={{
+    problem: "You know the cluster 'reconciles desired state,' but that phrase hides a real machine: processes, a database, and a network of components that must agree.",
+    mechanism: "Split the cluster into two halves — a control plane that decides, and worker nodes that run — and name every process in each.",
+    takeaway: "A Kubernetes cluster is a handful of ordinary programs, each running one loop, all coordinating through a single front door.",
+  }}
+  quiz={{
+    question: "At the highest level, a Kubernetes cluster is divided into which two parts?",
+    options: [
+      { text: "A frontend and a backend." },
+      { text: "A control plane that decides what should run, and worker nodes that actually run it.", correct: true },
+      { text: "A primary database and its replicas." },
+    ],
+  }}
+>
+
+So far Kubernetes has been a single idea — a loop that makes reality match a
+declaration — and a promise that the idea is enough to build everything else on.
+Now we cash that promise. By the end of this chapter you'll be able to point at
+every process in a running cluster, say what loop it runs, and trace exactly how
+the words `kubectl apply` end with a container breathing on some machine you
+never named.
+
+Start with the cleanest cut in the whole system. A cluster is split into two
+kinds of machines doing two completely different jobs:
+
+- The **control plane** is the brain. It holds what you declared, decides what
+  should happen, and runs the reconcile loops. It makes no containers itself.
+- The **worker nodes** are the hands. Each runs an agent that does what the
+  brain decided: pull images, start containers, wire up networking.
+
+This separation is why a cluster survives a node catching fire. The brain lives
+elsewhere, notices the node went silent, and reschedules its work. Keep the two
+halves distinct in your head and nothing else in this chapter will surprise you.
+
+<Callout type="note">
+A small cluster can run the control plane *on* a machine that also does work,
+and tools like minikube cram everything onto your laptop. That's a packaging
+convenience. Logically the two halves are always separate, and in production
+they run on separate machines so the brain stays up when the hands fail.
+</Callout>
+
+</Section>
+
+<Section
+  id="api-and-etcd"
+  title="The front door and the memory"
+  brief={{
+    problem: "A dozen independent loops all need to read 'desired' and write 'actual' without trampling each other or disagreeing about the truth.",
+    mechanism: "One process — the API server — is the sole gateway, and it persists everything in etcd, a consistent store. Nothing else touches the database.",
+    cost: "Every interaction pays one hop through the API server; etcd must stay consistent and is the thing you back up.",
+    takeaway: "The API server is the only door; etcd is the only truth. Everything else is a client.",
+  }}
+  quiz={{
+    question: "Why is it significant that only the API server talks to etcd directly?",
+    options: [
+      { text: "It makes etcd run faster." },
+      { text: "One gateway means every change is validated, authorized, and recorded in exactly one place — the rest of the system stays consistent and observable.", correct: true },
+      { text: "It lets components skip authentication." },
+    ],
+  }}
+>
+
+If many loops are going to cooperate, they need to agree on two things: where
+"desired" is written and where "actual" is recorded. Kubernetes makes that
+agreement physical with two components.
+
+The **kube-apiserver** is the single front door. This is the rule that holds the
+whole design together: *nobody edits cluster state directly* — not you, not the
+scheduler, not the kubelet on a node. Everyone sends a request to the API server,
+which authenticates it, checks you're allowed, validates the object, and only
+then accepts it. Because there is exactly one door, there is exactly one place
+where every change is seen. That is what makes a cluster auditable and securable.
+
+Behind the door, **etcd** is the cluster's memory: a consistent, replicated
+key-value store. It holds both halves of every picture — the `spec` you declared
+and the `status` the components observe. When a controller "compares desired to
+actual," etcd is what it's reading through the API server. etcd uses the Raft
+consensus algorithm so a majority of its replicas always agree on the truth,
+even if one dies mid-write. This is also why etcd is the thing operators back up
+religiously: lose it and you've lost what the cluster is supposed to be.
+
+Notice the shape already: the API server is stateless plumbing in front of the
+one stateful thing. You can run several API servers for availability because
+they all read and write the same etcd. There is one brain, but it can have many
+mouths.
+
+</Section>
+
+<Section
+  id="scheduler-controllers"
+  title="The deciders: scheduler and controllers"
+  brief={{
+    problem: "A declared Deployment is just a row in etcd. Something has to turn 'I want 3 replicas' into 'these specific Pods belong on these specific nodes.'",
+    mechanism: "Controllers create the objects desired state implies; the scheduler assigns each unplaced Pod to a node. Both only read and write through the API server.",
+    takeaway: "Controllers decide what objects should exist; the scheduler decides where Pods run. Neither one runs a container.",
+  }}
+  quiz={{
+    question: "A Deployment asks for 3 replicas but the Pods have no node yet. Whose job is it to pick nodes for them?",
+    options: [
+      { text: "The kubelet on each node." },
+      { text: "The kube-scheduler, which watches for unassigned Pods and binds each to a node.", correct: true },
+      { text: "etcd, by hashing the Pod name." },
+    ],
+  }}
+>
+
+etcd now holds your wish — say, a Deployment asking for three replicas. A wish
+is not a running program. Two kinds of decider close that gap, and crucially,
+*neither of them runs a container either*. They only manipulate objects.
+
+The **kube-controller-manager** is one process running a whole family of control
+loops. The Deployment controller notices your Deployment and creates a
+ReplicaSet. The ReplicaSet controller notices it should have three Pods and
+creates three Pod objects. The Node controller watches for nodes that stopped
+reporting and marks their Pods for rescheduling. Each loop is the same four
+steps from Chapter 1 — observe, compare, act, repeat — pointed at a different
+slice of the world. They all read desired and write actual through the API
+server; none of them reaches into etcd or onto a node directly.
+
+The **kube-scheduler** has one narrow, important job. It watches for Pods that
+exist but have no node assigned, and for each one it picks the best node. It
+filters out nodes that can't fit the Pod (not enough CPU or memory, wrong taints,
+failed affinity rules) and then scores the survivors, choosing the best. Its
+entire output is tiny: it writes the chosen node's name back onto the Pod. It
+starts nothing. It just decides *where*.
+
+There's also the **cloud-controller-manager**, which carves the cloud-specific
+loops out into their own process — provisioning a load balancer when you ask for
+one, attaching a disk, labeling nodes with their zone. Splitting it out keeps the
+core of Kubernetes vendor-neutral, so the same code runs on AWS, GCP, or your
+laptop.
+
+</Section>
+
+<Section
+  id="the-node"
+  title="The hands: what runs on a worker node"
+  brief={{
+    problem: "The scheduler wrote a node name onto a Pod. That's still just text in etcd — no container is running anywhere yet.",
+    mechanism: "Each node runs a kubelet that watches for Pods assigned to it and drives the container runtime; kube-proxy wires up Service networking.",
+    takeaway: "The kubelet is where decisions finally become processes. Everything above it only moved objects around.",
+  }}
+  quiz={{
+    question: "What finally turns a scheduled Pod object into actual running containers?",
+    options: [
+      { text: "The scheduler starts them once it picks a node." },
+      { text: "The kubelet on the chosen node sees the Pod is assigned to it and tells the container runtime to start the containers.", correct: true },
+      { text: "etcd executes the container image." },
+    ],
+  }}
+>
+
+Everything so far has just shuffled objects in etcd. No container exists yet.
+That changes on the worker node, where three programs turn decisions into
+processes. Click through them:
+
+<Figure number="6.1" caption="The whole cluster on one canvas: the control plane (top) decides and remembers; a worker node (bottom) runs. Every arrow of communication actually goes through the API server.">
+  <Diagram client:visible id="cp-full" title="Control plane and worker node" nodes={controlPlaneFullNodes} />
+</Figure>
+
+The **kubelet** is the node's agent and the hero of this step. It watches the API
+server for Pods assigned to *its* node. When it sees one, it tells the container
+runtime to pull the images and start the containers, then it watches them and
+reports their status back up — `Running`, `Ready`, restart counts. The kubelet is
+the bridge between the world of objects and the world of processes. Above it,
+everything was a row in a database; at the kubelet, a row becomes a living
+container.
+
+The **container runtime** — most commonly **containerd** — is the engine that
+actually does the low-level work: unpacking image layers, creating the Linux
+namespaces and cgroups, starting the process. The kubelet talks to it through a
+standard interface called the CRI, which is why Kubernetes doesn't care whether
+you run containerd or CRI-O underneath.
+
+**kube-proxy** handles the node's share of networking. When you create a Service
+(Chapter 9), kube-proxy programs the node's iptables or IPVS rules so that
+traffic aimed at the Service's virtual IP gets delivered to a real, healthy Pod.
+It's quiet plumbing, but it's why a stable address can sit in front of a moving
+set of Pods.
+
+</Section>
+
+<Section
+  id="trace-apply"
+  title="Tracing one `kubectl apply`"
+  brief={{
+    problem: "We've named every component in isolation. The real test is whether you can follow one command across all of them without losing the thread.",
+    mechanism: "Walk a single `kubectl apply` from your terminal, through the API server and etcd, past the controllers and scheduler, down to the kubelet.",
+    takeaway: "No component did the whole job. Each watched its slice and reacted — the relay race that is reconciliation.",
+  }}
+  quiz={{
+    question: "Put the journey of `kubectl apply -f deploy.yaml` in order.",
+    options: [
+      { text: "kubelet → scheduler → API server → etcd." },
+      { text: "API server validates and writes to etcd → controllers create ReplicaSet and Pods → scheduler assigns nodes → kubelet starts containers.", correct: true },
+      { text: "kubectl SSHes into each node and runs docker directly." },
+    ],
+  }}
+>
+
+Now the payoff. Watch one command travel the entire system. You run:
+
+<Figure number="6.2" caption="A simulated cluster. Run `kubectl apply -f web.yaml`, then `kubectl get pods`, then `kubectl get events` to see the trail each component left behind.">
+  <KubectlTerminal client:visible id="ch6-term" commands={applyFlowTerminal} />
+</Figure>
+
+Here is the relay, step by step:
+
+1. **kubectl → API server.** `kubectl` is just a polite HTTP client. It sends
+   your Deployment to the API server, which authenticates you, checks your
+   permissions, validates the object, and **writes it to etcd**. At this instant
+   the desired state exists; nothing is running.
+2. **Deployment controller reacts.** Watching the API server, it sees a new
+   Deployment with no ReplicaSet and creates one. Another write to etcd.
+3. **ReplicaSet controller reacts.** It sees a ReplicaSet wanting three Pods and
+   zero existing, so it creates three Pod objects — still just rows, each with no
+   node assigned.
+4. **Scheduler reacts.** It sees three unassigned Pods, picks a node for each
+   based on resources and rules, and writes the node name back onto each Pod.
+5. **kubelet reacts.** On each chosen node, the kubelet sees a Pod now assigned
+   to it, tells containerd to pull `web:v1` and start the container, and reports
+   `Running` back up through the API server.
+
+No single component built the Deployment. Each one watched its own slice of state
+and took one small action, and the sum of those reactions is a running service.
+That is the whole machine. Every chapter from here zooms into one of these
+components and asks it to do more interesting work.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The component model in this chapter is described, almost verb for verb, in the
+official architecture documentation — worth reading once you can already name the
+parts.
+
+- **Kubernetes Documentation — *Kubernetes Components* and *Cluster
+  Architecture*.** The canonical roster of control-plane and node components.
+  `kubernetes.io/docs/concepts/overview/components/`
+- **Kubernetes Documentation — *The Kubernetes API* and *Operating etcd clusters
+  for Kubernetes*.** Why the API server is the sole gateway and how etcd stays
+  consistent.
+- **Burns & Beda, *Kubernetes: Up and Running* (O'Reilly).** A clear narrative of
+  how the pieces fit and how a request flows through them.
+
+Next chapter: we stop at the kubelet's doorstep and ask what it actually starts.
+The answer isn't "a container" — it's a **Pod**, and the difference is the whole
+point of Chapter 7.
+
+</Section>
+
+</ChapterReader>
