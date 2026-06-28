@@ -24,6 +24,34 @@ export const containersQuiz: QuizQuestion[] = [
   },
 ];
 
+export const linuxQuiz: QuizQuestion[] = [
+  {
+    id: 'linux-1',
+    prompt: 'Namespaces and cgroups each control what?',
+    options: [
+      'Namespaces control what a process can see; cgroups control what it can use',
+      'Both limit CPU only',
+      'Namespaces compile images; cgroups push them',
+    ],
+    answerIndex: 0,
+    explanation: 'Namespaces isolate visibility (PIDs, network, mounts); cgroups limit consumption (CPU, memory, I/O).',
+  },
+];
+
+export const networkingQuiz: QuizQuestion[] = [
+  {
+    id: 'net-1',
+    prompt: 'Why do services use DNS names instead of hard-coded IPs?',
+    options: [
+      'Container IPs are ephemeral and change on restart/reschedule',
+      'DNS is faster than IP',
+      'IPs are not allowed in clusters',
+    ],
+    answerIndex: 0,
+    explanation: 'A stable name keeps pointing at the right address as disposable containers come and go.',
+  },
+];
+
 export const distSysQuiz: QuizQuestion[] = [
   {
     id: 'distsys-1',

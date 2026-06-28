@@ -3,7 +3,9 @@ title: Linux Internals
 description: Namespaces, cgroups, processes, and filesystems.
 ---
 import Diagram from '../../../components/Diagram';
+import Quiz from '../../../components/Quiz';
 import { isolationNodes } from '../../../data/diagrams';
+import { linuxQuiz } from '../../../data/quizzes';
 
 Here is the secret that demystifies containers: **a container is just a normal
 Linux process.** There is no tiny virtual machine inside. When you run a
@@ -42,3 +44,7 @@ A container's root filesystem is the image's read-only layers stacked by a
 **union filesystem**, with one thin writable layer on top. Writes go to that top
 layer and vanish when the container is removed — which is why container storage
 is *ephemeral* by default, and why Part 1's Volumes chapter exists.
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-linux" questions={linuxQuiz} />

@@ -3,7 +3,9 @@ title: Networking Basics
 description: TCP/IP, DNS, and load balancing for cluster newcomers.
 ---
 import KubectlTerminal from '../../../components/KubectlTerminal';
+import Quiz from '../../../components/Quiz';
 import { firstPodsTerminal } from '../../../data/terminals';
+import { networkingQuiz } from '../../../data/quizzes';
 
 Kubernetes is, to a large degree, a networking system: its job is to let a
 shifting set of containers find and talk to each other reliably. Three classic
@@ -41,3 +43,7 @@ You will not memorize commands by reading them. This simulated terminal returns
 realistic output — try `kubectl get nodes` and `kubectl get pods`:
 
 <KubectlTerminal client:visible id="net-term" commands={firstPodsTerminal} />
+
+## Check your understanding
+
+<Quiz client:visible id="quiz-networking" questions={networkingQuiz} />

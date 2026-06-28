@@ -10,7 +10,16 @@ hero:
       icon: right-arrow
 ---
 
+import ProgressTracker from '../../components/ProgressTracker';
+import { completionIds } from '../../data/chapters';
+
 Welcome. This book builds Kubernetes understanding from the ground up — starting
 with the container and Linux fundamentals underneath it, then the core API, then
 the advanced and production layers. Every chapter is interactive: quizzes, a
 simulated `kubectl` terminal, clickable diagrams, and progress that follows you.
+
+## Your progress
+
+Finish a chapter's quiz to tick it off. Your progress is saved in this browser.
+
+<ProgressTracker client:visible chapterIds={completionIds} />
